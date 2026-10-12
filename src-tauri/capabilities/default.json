@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "hiveproxy 主窗口所需的权限。注意 Tauri v2 默认**不允许**前端调用 event.listen —— 少了这一条，前端的初始化会整段中断，界面会白屏。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:app:allow-app-hide",
+    "core:app:allow-app-show",
+    "core:window:allow-start-dragging"
+  ]
+}

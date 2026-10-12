@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hiveproxy</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="brand">
+    <span class="logo">⬡</span>
+    <div>
+      <div class="bname">hiveproxy</div>
+      <div class="bver" id="ver">—</div>
+    </div>
+  </div>
+
+  <nav id="nav">
+    <button data-view="overview" class="active"><i>◫</i>概览</button>
+    <button data-view="topology"><i>⬡</i>拓扑</button>
+    <button data-view="rules"><i>⇄</i>路由规则</button>
+    <button data-view="config"><i>⚙</i>配置</button>
+    <button data-view="logs"><i>▤</i>日志</button>
+  </nav>
+
+  <div class="servicebox">
+    <div class="svcrow">
+      <span class="dot" id="svc-dot"></span>
+      <span id="svc-text" class="svctext">未启动</span>
+      <button id="btn-power" class="power">启动</button>
+    </div>
+    <div class="kv"><span class="k">本机</span><span class="v mono" id="side-node">—</span></div>
+    <div class="kv"><span class="k">代理</span><span class="v mono" id="side-socks">—</span></div>
+    <div id="sidefoot" class="foot"></div>
+  </div>
+</aside>
+
+<main>
+  <header class="topbar">
+    <h1 id="view-title">概览</h1>
+    <div class="banner" id="banner"></div>
+    <div class="actions" id="topactions"></div>
+  </header>
+
+  <!-- ───────── 概览 ───────── -->
+  <section class="view" id="view-overview">
+    <div class="cards" id="cards"></div>
+
+    <div class="grid2">
+      <div class="panel">
+        <h2>活跃流</h2>
+        <p class="hint">本机 SOCKS5 正在承载的连接。</p>
+        <ul class="list scroll" id="streams"></ul>
+      </div>
+      <div class="panel">
+        <h2>出口探测</h2>
+        <p class="hint">填一个目标，看它会走哪个出口（不真正建流）。</p>
+        <div class="row">
+          <input id="probe-input" class="grow" placeholder="10.4.0.9:3389" />
+          <button id="btn-probe">探测</button>
+        </div>
+        <pre class="out" id="probe-out">—</pre>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>引导种子</h2>
+      <p class="hint">跨网段的<b>第一条</b>链路只能靠它点火；接通之后，监听端点广播会把其余候选自动补齐。每台写 0~1 条即可。</p>
+      <div class="row">
+        <input id="seed-input" class="grow" placeholder="10.1.2.3:20000" />
+        <button id="btn-seed-add">添加</button>
+      </div>
+      <ul class="list" id="seed-list"></ul>
+    </div>
+  </section>
+
+  <!-- ───────── 拓扑 ───────── -->
+  <section class="view hidden" id="view-topology">
+    <div class="panel">
+      <div class="row between">
+        <div>
+          <h2>网络拓扑（DAG）</h2>
+          <p class="hint">以本机为根按跳数分层。亮线＝BFS 主路径，淡线＝其余声明边。</p>
+        </div>
+        <div class="row nowrap">
+          <label class="chk"><input type="checkbox" id="dag-labels" checked /> 显示地址</label>
+          <label class="chk"><input type="checkbox" id="dag-relay" checked /> 显示其余边</label>
+        </div>
+      </div>
+      <div class="dagwrap"><svg id="dag"></svg></div>
+      <div class="legend">
+        <span><i class="sw self"></i>本机</span>
+        <span><i class="sw direct"></i>直连</span>
+        <span><i class="sw relay"></i>经中继</span>
+        <span><i class="sw nogress"></i>不做出口</span>
+        <span><i class="sw down"></i>不可达</span>
+      </div>
+    </div>
+
+    <div id="zones-wrap" class="panel hidden">
+      <h2>网段真冲突（§9.3 情形二）</h2>
+      <p class="hint">同一个私网段被两片<b>互不相邻</b>的孤岛分别声明。片内目标照常填真实 IP；要到片外才需要带区域号。</p>
+      <div id="zones"></div>
+    </div>
+
+    <div class="panel">
+      <h2>节点</h2>
+      <div class="tablewrap"><table id="nodes"><thead><tr>
+        <th>节点</th><th>别名</th><th>共享网段</th><th>监听</th><th>跳数</th><th>成本</th><th>路径</th><th>出口</th><th>心跳</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="panel">
+      <h2>直连链路</h2>
+      <div class="tablewrap"><table id="edges"><thead><tr>
+        <th>对端</th><th>载体</th><th>健康</th><th>拨号方</th><th>RTT</th><th>成本</th><th></th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ───────── 规则 ───────── -->
+  <section class="view hidden" id="view-rules">
+    <div class="panel">
+      <div class="banner soft" id="shared-banner">共享规则集：无</div>
+      <p class="hint">
+        顺序即优先级，<b>先匹配者胜</b>。本地规则整体排在共享规则之前，所以本地永远能覆盖共享。
+        不写任何规则也完全正常 —— 内置的网段自动匹配会兜住绝大多数目标。
+      </p>
+      <div class="row">
+        <button id="btn-rule-add" class="primary">+ 新增规则</button>
+        <button id="btn-rule-sort" class="ghost">按具体度重排</button>
+        <button id="btn-rule-preview" class="ghost">发布前预览</button>
+        <button id="btn-rule-save">保存本地规则</button>
+        <span class="spacer"></span>
+        <button id="btn-rule-publish" class="ok">一键发布到全网</button>
+        <button id="btn-rule-revoke" class="danger">撤回共享</button>
+      </div>
+      <div class="tablewrap"><table id="rules" class="editable"><thead><tr>
+        <th style="width:34px">#</th><th style="width:52px">启用</th><th>host</th><th style="width:110px">port</th>
+        <th style="width:210px">egress</th><th style="width:110px">不可达</th><th style="width:170px">备注</th>
+        <th style="width:70px">命中</th><th style="width:140px">最近出口</th><th style="width:110px"></th>
+      </tr></thead><tbody></tbody></table></div>
+      <p class="hint" style="margin-top:10px">
+        egress 写法：<code>auto</code> · <code>direct</code> · <code>node:10.1.2.3</code>（裸 IP 等价）·
+        <code>alias:gpu-01</code>（仅本地规则可用）· <code>group:db</code> · <code>group:subnet:10.9.0.0/16</code> · <code>block</code>
+      </p>
+    </div>
+
+    <div class="panel" id="preview-panel" style="display:none">
+      <h2>发布前预览</h2>
+      <pre class="out" id="preview-out"></pre>
+    </div>
+
+    <div class="panel">
+      <h2>规则命中统计</h2>
+      <p class="hint">「从来没命中」的规则往往意味着写错了，或者被前面的规则完全遮蔽了。</p>
+      <div class="tablewrap"><table id="rule-stats"><thead><tr>
+        <th style="width:40px">#</th><th>规则</th><th style="width:80px">命中</th>
+        <th style="width:150px">最近出口</th><th style="width:150px">最近被拒</th>
+      </tr></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- ───────── 配置 ───────── -->
+  <section class="view hidden" id="view-config">
+    <div class="panel">
+      <div class="row between">
+        <div>
+          <h2>配置</h2>
+          <p class="hint">改动即时生效并落盘。标 ★ 的改动（监听端口、绑定地址、SOCKS5 绑定）需要重启服务。</p>
+        </div>
+        <div class="row nowrap">
+          <button id="btn-cfg-reload" class="ghost">从磁盘重读</button>
+          <button id="btn-cfg-save" class="primary">保存并应用</button>
+        </div>
+      </div>
+      <div id="cfg-form"></div>
+    </div>
+
+    <div class="panel">
+      <h2>高级：直接编辑 TOML</h2>
+      <p class="hint">表单覆盖不到的内容在这里改。「校验」只检查语法与告警，不会应用。</p>
+      <div class="row">
+        <button id="btn-toml-load" class="ghost">从当前配置刷新</button>
+        <button id="btn-toml-check">校验</button>
+        <button id="btn-toml-apply" class="ok">应用</button>
+        <span class="spacer"></span>
+        <span class="hint mono" id="data-dir"></span>
+      </div>
+      <textarea id="toml" spellcheck="false"></textarea>
+      <pre class="out" id="toml-out"></pre>
+    </div>
+  </section>
+
+  <!-- ───────── 日志 ───────── -->
+  <section class="view hidden" id="view-logs">
+    <div class="panel">
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="log-follow" checked /> 自动滚动</label>
+        <select id="log-level">
+          <option value="debug">debug 及以上</option>
+          <option value="info" selected>info 及以上</option>
+          <option value="warn">warn 及以上</option>
+          <option value="error">仅 error</option>
+        </select>
+        <input id="log-filter" class="grow" placeholder="关键字过滤…" />
+        <button id="btn-log-clear" class="ghost">清空</button>
+      </div>
+      <pre id="log"></pre>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+<script src="main.js"></script>
+</body>
+</html>

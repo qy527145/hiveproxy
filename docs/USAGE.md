@@ -1,0 +1,229 @@
+# hiveproxy 使用说明
+
+写给**装机的运维**（不是写给看实现的人）。配套的系统设计见 [DESIGN.md](DESIGN.md)。
+
+---
+
+## 0. 一句话
+
+每台机器装同一个程序、填**两项**配置，然后照常填真实的内网 `ip:端口` 去访问 ——
+hiveproxy 自己决定"这个目标该由谁去连"。
+
+---
+
+## 1. 每台机器要配什么
+
+### 1.1 必须的（两项）
+
+| 配置项 | 怎么填 | 为什么必须 |
+| :--- | :--- | :--- |
+| `[listen] ports` | **IT 授权给这台机器的入向端口**，如 `[20000]` | 这是**唯一必须从 IT 那里逐个问到的信息**。防火墙放行的是"(源, 目的, 端口)"许可，路的尽头必须有人监听 —— 这个端口就是 hiveproxy 的监听端口。**它必须等于别人 `seeds` 里写的端口** |
+| `[peers] seeds` | 我能拨通的**第一台**机器，如 `["10.1.2.3:20000"]`，**每台 0~1 条** | 跨网段的**引火柴**。一旦接通任意一台，全网节点会广播自己的监听端点，其余候选自动汇聚，不需要逐个写对端 |
+
+> `seeds` 是引火柴，不是对端清单。**整个网络配一次引导就够了。**
+
+### 1.2 按情况才要的
+
+| 配置项 | 什么时候需要 |
+| :--- | :--- |
+| `[[route.rules]]` | 见第 4 节。**可以一条都不写**，这是完全正常的用法 |
+| `[node] overlay_addr` | **极罕见**：两片互不相通的网段撞了同一个私网地址。地址唯一时永远不用管 |
+| `[share] auto_share_subnets = false` | 敏感机器：参与网络，但不把自己的局域网**告诉**全网。**我自己照常访问自己的局域网** |
+| `[egress] allow_egress = false` | 敏感机器：不替别人转发，别人的流量不会被引到这台机器上。**我自己照常出得去** |
+| `[node] alias` | 想让规则里用 `alias:gpu-01` 而不是记 IP |
+
+### 1.3 永远不用管的
+
+`listen.bind`、`share.auto_share_subnets`、`egress` 超时与缓存、`route` 全部参数、
+`discovery` 全部参数、`proxy.socks5_bind`。默认值就是对的。
+
+---
+
+## 2. n 台机器的落地顺序
+
+**关键：每个网段只需要配 1 台。**
+
+```
+阶段 1  全部机器安装、启动，每台填 listen.ports
+        → 同网段的机器靠 UDP 广播自动互相发现，此时已经可以互通
+
+阶段 2  每个网段挑 1 台"锚"节点配 seeds（指向另一个网段的锚）
+        → 同网段其余机器靠 LAN 自动发现锚，零配置
+
+阶段 3  验证：随便哪台机器访问另一个网段的 IP
+
+阶段 4（可选）  写一批规则，一键发布给全网
+```
+
+**注意防火墙的方向性**：`seeds` 只能写"我这台真的拨得通"的地址。
+A 能拨 B 不代表 B 能拨 A —— 但**只要 A 拨通了 B，这条 TCP 会话就是全双工的**，
+B 可以在这条会话上把数据回传给 A。所以不需要双向孔洞。
+
+如果 **UDP 广播被禁**，阶段 2 退化成"每台都要配一条 seeds"。
+
+---
+
+## 3. 日常使用
+
+### 3.1 把应用指到本地代理
+
+```
+SOCKS5 代理：127.0.0.1:1080
+```
+
+```bash
+# curl：务必用 socks5-hostname
+curl --socks5-hostname 127.0.0.1:1080 http://10.4.0.9:8080/health
+
+# SSH
+ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.4.0.9
+```
+
+> ⚠️ **用 `--socks5-hostname`（不是 `--socks5`）**。区别是域名在哪解析 ——
+> 必须让**出口节点**去解析，因为企业内网普遍是 split-horizon DNS：
+> 同一个域名在 A 网段解析到内网地址、在 B 网段解析到公网或直接失败。
+
+### 3.2 能访问的范围
+
+**所有节点的本地网段之和。** 每台机器默认把自己所在的整个子网（全部 IP、全部端口）
+贡献给全网，所以：任意节点网段里的**任意 `IP:端口`** 都能直接连；
+中间可能跨 1~N 跳中继，但对应用完全透明；**双向都通**。
+
+### 3.3 网络自己会做的事（不用管）
+
+- 同网段自动发现、自动建链
+- 新节点加入后秒级被全网发现
+- 某条链路断了自动绕行（有替代路径时）
+- 某个节点掉线不影响其他人（除非那一跳是唯一通路）
+
+---
+
+## 4. 什么时候需要写路由规则
+
+**默认一条都不写是对的。** 只有这四种情形才需要：
+
+| 情形 | 规则写法 |
+| :--- | :--- |
+| **访问域名**，且只有某个网段能解析它 | `host = "api.corp.example.com"`, `egress = "node:10.1.2.3"` |
+| 目标**不在任何节点的网段里**，但某台机器事实上够得着（静态路由 / VPN / 跳板机） | `host = "10.9.0.0/16"`, `egress = "group:subnet:10.9.0.0/16"` |
+| 想**强制**某类流量走特定出口（性能 / 合规） | `host = "*.db.corp.com"`, `egress = "group:db"` |
+| 想**屏蔽**某类目标 | `host = "*.torrent.example"`, `egress = "block"` |
+
+**一个要记住的推论**：域名目标**永远不可能**靠自动匹配命中（没有 IP 可比），必须写规则。
+
+### `egress` 的写法
+
+| 写法 | 含义 |
+| :--- | :--- |
+| `auto` | 交给内置网段规则：命中网段的声明者里选最近的一个 |
+| `direct` | 本机直接连，不进 overlay |
+| `node:10.1.2.3`（裸 IP 等价） | 钉死一个出口节点 |
+| `alias:gpu-01` | 用别名写（**只在本地规则里可用**，发布时会解析成 IP） |
+| `group:db` | 显式集合，成员写在 `[[route.groups]]` 里 |
+| `group:subnet:10.9.0.0/16` | **派生集合**，成员 = 声明了该网段的节点，随拓扑自动增减 —— 推荐 |
+| `block` | 拒绝 |
+
+**能用 group 就别用 node**：把一类目标钉死在单个节点上，那个节点一停就全断。
+
+### 一键发布
+
+你是所有机器的管理者，所以规则写一次就行：在规则页点「发布前预览」看影响面，
+确认后点「一键发布」。发布后：
+
+- 每台机器都生效，不用逐台配
+- 但**每台机器本地的规则永远排在共享规则之前** —— 想例外就改自己那份，谁也覆盖不了
+- 规则页顶部常驻显示"当前共享策略来自谁、revision 几"
+- 发错了？点「全局旁路」一键回到纯自动匹配，或「撤回共享规则」
+
+---
+
+## 5. 做不到什么
+
+1. **不能突破防火墙**，只能利用已有的孔洞。
+2. **不能访问"没有任何节点够得着"的目标** —— 会回 SOCKS5 `Host unreachable`。
+3. **不支持 UDP**，只有 SOCKS5 CONNECT（TCP）。
+4. **授权端口被别的服务占用时，那台的入向孔洞就废了** —— 只能靠出向链路或中继。
+   启动时日志里会明确报出来，不会静默失败。
+5. **多跳会增加延迟。**
+6. **v1 是明文的**：多跳路径上的中间节点能看到业务内容。
+7. **本机的 SOCKS5 默认只服务回环地址**，要服务容器/虚拟机得显式打开 `allow_remote_socks`。
+
+---
+
+## 6. 日常运维
+
+| 场景 | 怎么做 |
+| :--- | :--- |
+| 加一台新机器 | 装程序 → 填 `listen.ports` + 一条 `seeds`（指向本网段的锚）→ 完成，几秒内全网可见 |
+| 不想当网关 | 设 `egress.allow_egress = false` —— 只是不替别人转发，**不影响自己的任何访问** |
+| 改配置 | 界面里改（热更新），或直接改 `hiveproxy.toml` 后重启 |
+| 看拓扑 | 拓扑页：节点、网段、跳数、成本、直连状态、每个节点是否愿意做出口 |
+| 排障 | ① 拓扑图看哪条边断了；② 规则页的"命中统计"看哪条规则从来没生效；③ 日志里失败原因被区分成 RST / 超时 / 拨到非节点服务三类 |
+| 验证某个目标走哪 | 用「出口探测」填 `ip:端口`，看它选了哪个出口 |
+| 应急 | 「全局旁路」忽略全部规则，回到纯网段匹配 |
+
+**一个安全习惯**：定期看一下规则页顶部的"当前共享策略来自谁"。
+因为发布不限制来源，这条提示是发现异常下发的唯一入口。
+
+---
+
+## 7. 没有图形界面的服务器
+
+装 `hiveproxy-cli`（与桌面版是同一套引擎，能力完全一致）：
+
+```bash
+hiveproxy-cli init                          # 生成 hiveproxy.toml
+vi hiveproxy.toml                           # 至少改 [listen] ports 与 [peers] seeds
+hiveproxy-cli check                         # 校验（有告警会列出来）
+hiveproxy-cli run                           # 前台运行，Ctrl-C 优雅退出
+```
+
+跑起来之后，**不用重启**就能查询和修改：
+
+```bash
+hiveproxy-cli status                        # 状态摘要
+hiveproxy-cli nodes                         # 拓扑里的节点
+hiveproxy-cli rules                         # 规则表与命中统计
+hiveproxy-cli probe 10.4.0.9:3389           # 这个目标会走哪个出口
+hiveproxy-cli zones                         # 网段真冲突与区域号
+hiveproxy-cli reload                        # 改完配置文件后热更新
+hiveproxy-cli bypass true                   # 排障：全局旁路，忽略全部规则
+hiveproxy-cli publish                       # 把当前本地规则整份发布到全网
+hiveproxy-cli --json status                 # 机器可读输出
+```
+
+它背后是一个本地管理 socket（默认 `<数据目录>/data/hiveproxy.sock`，其它平台是
+`127.0.0.1:10800`），`nc` 也能直接说话：
+
+```bash
+echo status | nc -U /var/lib/hiveproxy/data/hiveproxy.sock
+echo '{"cmd":"probe","target":"10.4.0.9:3389"}' | nc -U /var/lib/hiveproxy/data/hiveproxy.sock
+```
+
+**systemd**：
+
+```ini
+[Unit]
+Description=hiveproxy
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hiveproxy-cli run --config /etc/hiveproxy/hiveproxy.toml --data-dir /var/lib/hiveproxy
+Restart=always
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable --now hiveproxy
+journalctl -u hiveproxy -f
+hiveproxy-cli -c /etc/hiveproxy/hiveproxy.toml status
+```
+
+> 管理接口**没有任何认证**，因此只允许绑回环地址或 Unix socket；配置成外部地址会被直接拒绝启动。
+> 需要远程管理就在外面套 SSH：
+> `ssh server 'hiveproxy-cli -c /etc/hiveproxy/hiveproxy.toml status'`
