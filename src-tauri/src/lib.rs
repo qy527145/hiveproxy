@@ -432,8 +432,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// ★ 回归守卫：Tauri v2 默认**不允许**前端调用 `event.listen`。
-    /// 少了这条权限，前端 `DOMContentLoaded` 里的 `await listen(...)` 会抛错，
-    /// 后面整段初始化都不执行 —— 表现就是"界面全空"，而且很难猜。
+    /// 少了这条权限，前端 `startEventBridge()` 里的 `await listen("hive")` 会抛错，
+    /// 事件桥与随后的初始化都建不起来 —— 界面画得出来，但数据永远停在初始状态，
+    /// 而且原因不出现在任何日志里（现在会经 `ui_log` 回传，见 lib/report.ts）。
     /// 这个坑踩过一次，钉在这里。
     #[test]
     fn capabilities_must_allow_event_listen() {

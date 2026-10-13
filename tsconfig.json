@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  // 只有一个 tsconfig：vite.config.ts 也一起检查。
+  // （官方的 react-ts 模板拆成两个并用 project references，但 referenced project
+  //  不能 noEmit —— 于是要么让它生成 .d.ts 垃圾文件，要么像这样干脆合一。
+  //  这里不需要 Node 类型，所以合一没有任何代价。）
+  "include": ["src", "vite.config.ts"]
+}

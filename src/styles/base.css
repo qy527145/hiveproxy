@@ -1,0 +1,344 @@
+/* 通用块：面板、表格、控件、列表、标签、横幅、卡片。
+   这些是全应用复用的"零件"，与具体页面无关。 */
+
+/* ── 面板 ─────────────────────────────────────── */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 15px 16px;
+  min-width: 0;
+}
+.panel h2 {
+  margin: 0 0 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.hint {
+  color: var(--dim);
+  font-size: 12px;
+  margin: 0 0 11px;
+}
+.hint code {
+  background: var(--panel2);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--cyan);
+  font-size: 11px;
+}
+.sub {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dim);
+}
+.star {
+  color: var(--warn);
+}
+.dirty {
+  color: var(--warn);
+  font-size: 12px;
+}
+
+/* ── 行与栅格 ─────────────────────────────────── */
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.row:last-child {
+  margin-bottom: 0;
+}
+.row.nowrap {
+  flex-wrap: nowrap;
+  margin-bottom: 0;
+}
+.row.between {
+  justify-content: space-between;
+  align-items: flex-start;
+}
+.row .grow {
+  flex: 1 1 160px;
+  min-width: 0;
+  width: 100%;
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 1000px) {
+  .grid2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ── 卡片 ─────────────────────────────────────── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 11px 13px;
+}
+.card .k {
+  color: var(--dim2);
+  font-size: 11px;
+}
+.card .v {
+  font-size: 19px;
+  font-weight: 600;
+  margin-top: 2px;
+  letter-spacing: 0.3px;
+}
+.card.good .v {
+  color: var(--ok);
+}
+.card.bad .v {
+  color: var(--err);
+}
+.card.wide {
+  grid-column: 1 / -1;
+}
+.card.wide .v {
+  font-size: 12px;
+  font-weight: 500;
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+/* ── 表格 ─────────────────────────────────────── */
+.tablewrap {
+  overflow-x: auto;
+  min-width: 0;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+th {
+  text-align: left;
+  color: var(--dim2);
+  font-weight: 500;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line2);
+  white-space: nowrap;
+}
+td {
+  padding: 5px 8px;
+  border-bottom: 1px solid #1b202b;
+  vertical-align: middle;
+}
+tbody tr:last-child td {
+  border-bottom: 0;
+}
+tbody tr:hover {
+  background: #171c26;
+}
+tr.self td {
+  color: var(--accent);
+}
+tr.dim td {
+  color: var(--dim2);
+}
+/* 从 DAG 点过来时闪一下，配合 scrollIntoView 告诉用户"就是这行" */
+tr.flash td {
+  background: #22304a;
+  transition: background 0.4s ease-out;
+}
+table.editable input,
+table.editable select {
+  width: 100%;
+}
+
+/* ── 控件 ─────────────────────────────────────── */
+input,
+select,
+textarea {
+  background: var(--panel2);
+  border: 1px solid var(--line2);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font: inherit;
+  min-width: 0;
+  width: 100%;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 1px solid var(--info);
+  border-color: var(--info);
+}
+input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
+}
+select {
+  width: auto;
+}
+textarea {
+  height: 320px;
+  font: 12px/1.55 var(--mono);
+  resize: vertical;
+}
+
+button {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--line2);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button:hover {
+  border-color: #3d465c;
+  background: #1f2532;
+}
+button.primary {
+  background: #24406e;
+  border-color: #33598f;
+}
+button.ok {
+  background: #1f4a37;
+  border-color: #2f6b4f;
+}
+button.danger {
+  background: #46242f;
+  border-color: #68323f;
+}
+button.ghost {
+  background: transparent;
+}
+button.mini {
+  padding: 2px 7px;
+  font-size: 12px;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.chk {
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* ── 横幅 ─────────────────────────────────────── */
+.banner {
+  padding: 5px 11px;
+  border-radius: 6px;
+  font-size: 12px;
+  min-width: 0;
+}
+.banner.soft {
+  background: var(--panel2);
+  color: var(--dim);
+  display: block;
+  margin-bottom: 10px;
+}
+.banner.warn {
+  background: #443415;
+  color: #ffd88a;
+}
+.banner.err {
+  background: #452230;
+  color: #ffb3c0;
+}
+
+/* ── 列表 ─────────────────────────────────────── */
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+}
+.list.scroll {
+  max-height: 260px;
+  overflow-y: auto;
+}
+.list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 0;
+  border-bottom: 1px solid #1b202b;
+  min-width: 0;
+}
+.list li:last-child {
+  border-bottom: 0;
+}
+.list li .grow {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+.empty {
+  color: var(--dim2);
+  font-size: 12px;
+  padding: 6px 0;
+}
+
+/* ── 标签 ─────────────────────────────────────── */
+.pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--line2);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.pill.ok {
+  color: var(--ok);
+  border-color: #2c5a45;
+}
+.pill.no {
+  color: var(--err);
+  border-color: #5a2c38;
+}
+.pill.cy {
+  color: var(--cyan);
+  border-color: #2b5750;
+}
+
+/* ── 输出块与日志等级色 ───────────────────────── */
+.out {
+  background: #0a0c11;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  margin: 0;
+  font: 12px/1.6 var(--mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+  color: var(--dim);
+}
+.lv-debug {
+  color: var(--dim2);
+}
+.lv-info {
+  color: var(--dim);
+}
+.lv-warn {
+  color: var(--warn);
+}
+.lv-error {
+  color: var(--err);
+}

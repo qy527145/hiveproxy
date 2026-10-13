@@ -1,0 +1,59 @@
+/* 设计令牌 + 全局基线。
+   改配色只改这一处 —— 其余样式全部引用这些变量。 */
+
+:root {
+  --bg: #0b0d12;
+  --side: #0f121a;
+  --panel: #141822;
+  --panel2: #1a1f2b;
+  --line: #232a38;
+  --line2: #2e3648;
+  --fg: #e8ebf2;
+  --dim: #8b93a7;
+  --dim2: #5d6577;
+  --accent: #ffc857;
+  --cyan: #4fd1c5;
+  --ok: #57c98a;
+  --warn: #e8a33d;
+  --err: #e5657a;
+  --info: #6ba7ff;
+  --r: 10px;
+  --sidenav: 214px;
+  --mono: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;
+  font: 13px/1.6 "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+/* ★ 布局的 flex 容器是 #root，**不是 body**。
+   React 把界面挂在 #root 里，于是 aside/main 成了 body 的孙节点 ——
+   照静态页那样给 body 加 display:flex 是不会生效的：侧栏与主区会退化成
+   上下堆叠的块，窗口上半截全黑、内容被挤到下半截。（这个坑踩过一次。） */
+#root {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+.spacer {
+  flex: 1 1 auto;
+}

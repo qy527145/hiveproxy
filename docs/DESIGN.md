@@ -16,7 +16,7 @@
 - 配置模型、安全演进路径、可观测性与 Tauri 集成
 - 里程碑、验收标准、测试策略、已知风险
 
-不在本文档范围：Tauri 前端具体页面实现细节（仅约定事件与命令契约）、CI/打包发布流程。
+不在本文档范围：Tauri 前端的具体页面实现（只约定事件与命令契约，前端代码见 `src/`）、CI/打包发布流程。
 
 ---
 
@@ -752,6 +752,14 @@ pub trait CryptoProvider: Send + Sync {
 ### 6.7 组件 G：可观测性与 Tauri 集成
 
 **分 crate**：`hiveproxy-core`（纯 Rust，无 Tauri 依赖，可独立测试与替换 UI）+ `hiveproxy-app`（Tauri 壳）。core 通过 `tokio::sync::broadcast` 对外发事件，Tauri 层转成前端事件。
+
+**前端**：React + TypeScript + Vite（`src/`，构建产物 `dist/` 由 Tauri 载入），与 core 之间**只**通过下面这份事件/命令契约耦合 —— 换掉整个前端不需要动 `hiveproxy-core` 一行。三条在前端侧被固化成代码结构、而不是靠自觉的约束：
+
+1. **任何一条命令失败都不允许白屏**：所有 IPC 走一层逐项容错的封装（返回 `{ok, v}` 而不是抛异常），服务没启动时配置页照样能编辑、能落盘；
+2. **浏览器侧的报错必须回传引擎日志**：`window.onerror`、未处理的 Promise 拒绝、React 错误边界三处统一走 `ui_log`。否则"白屏但日志里什么都没有"是极难排查的一类问题（§17 风险 11）；
+3. **每个视图外面套错误边界**：某个视图渲染崩溃只影响当前页，切到别的页面照常可用。
+
+类型契约（`src/lib/types.ts`）是 `view.rs` / `events.rs` / `rules.rs` / `config.rs` 的**手写镜像** —— 有意不做代码生成，因为它同时充当"改了 Rust 侧就要回来改这里"的显式提醒。
 
 事件契约：
 
@@ -1563,6 +1571,18 @@ pub enum E2eMode { Off, Required }
 
 v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、`hkdf`、`sha2`、`rand_core`。
 
+前端工具链（`package.json`，与 Rust 侧完全解耦，只在构建期被 Tauri 调用一次）：
+
+| 包 | 用途 |
+| :--- | :--- |
+| `react` + `react-dom` | 界面 |
+| `vite` | 构建与 dev server（dev 时 Tauri 的 `devUrl` 指向它） |
+| `typescript` | 类型检查（`tsc` 与 `vite build` 串在 `bun run build` 里） |
+| `@tauri-apps/api` | IPC（`invoke`）与事件（`listen`） |
+| `@tauri-apps/cli` | `bun run tauri dev` / `build` |
+
+刻意**没有**引入 `@vitejs/plugin-react`：Vite 内建的 esbuild 转换本身就支持 `.tsx`（`vite.config.ts` 里显式钉住 `esbuild.jsx = "automatic"`），少一个依赖就少一处"装不上／构建不了"的可能，代价只是没有 Fast Refresh（dev 下改组件是整页刷新）。需要热替换时再加回来即可，其余配置不用动。
+
 ---
 
 ## 14. 与 IDEA.md 的差异对照
@@ -1767,7 +1787,7 @@ v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、
 | 发现 | 变化驱动 flood + 周期一跳 + 反熵摘要（`digest`/`Pull`）、LAN UDP、常驻重连与退避 | `gossip.rs`、`discovery.rs`、`dialer.rs` |
 | L5 出口 | SOCKS5 `CONNECT`、错误码映射、直连短路 | `socks5.rs` |
 | 持久化 | 配置、共享规则集、发布 `revision` | `persist.rs` |
-| 编排与 UI | `HiveNode` API、Tauri v2 壳（含服务启停开关）、静态前端（概览/拓扑 DAG/规则/配置/日志） | `node.rs`、`src-tauri/`、`ui/` |
+| 编排与 UI | `HiveNode` API、Tauri v2 壳（含服务启停开关）、前端（概览/拓扑 DAG/规则/配置/日志） | `node.rs`、`src-tauri/`、`src/`、`index.html`、`vite.config.ts` |
 | 无界面运行 | 本地管理接口（Unix socket / 回环 TCP，JSON 与纯文本双协议）+ `hiveproxy-cli` | `admin.rs`、`crates/hiveproxy-cli/` |
 
 ### 19.2 实现过程中发现并修掉的设计缺陷
@@ -1786,7 +1806,7 @@ v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、
 | 10 | 第 3 条（广播中继）的连带影响：`dst = BROADCAST` 也会走进 `send_control_routed` 而报"无路由" | 广播帧专门走"发给除来源外的所有直连链路" |
 | 12 | **本机可达范围与"是否广播"被绑在一起**：`auto_share_subnets = false` 的敏感机器**连自己局域网都访问不了**（`NodeIdentity::resolve` 直接把 `subnets` 清空了） | 拆成两个概念：`subnets` 始终是网卡枚举结果（"我能连什么"），新增 `share_subnets` 单独控制"是否广播"（§9.1、§19.2 的第 13 条同源） |
 | 13 | **`allow_egress = false` 把本机自己也排除了**：`can_egress(self)` 返回 `self_accepts_egress`，于是敏感机器访问自己网段返回 `NoRoute`，`egress = "direct"` 的规则也失效 | `can_egress(self)` 恒为 `true`；`ResolveCtx` **删掉** `self_accepts_egress` 字段，让这个错误在类型层面写不出来。新增端到端回归 `self_is_still_an_egress_when_it_refuses_to_serve_others`（§9.4.4） |
-| 11 | **Tauri v2 的权限系统会让前端静默白屏**：没有 `capabilities` 声明时 `event.listen` 被拒，`DOMContentLoaded` 里的初始化整段中断，页面只剩初始 HTML（卡片、侧栏全空），而且原因不出现在任何日志里 | 新增 `src-tauri/capabilities/default.json`（含 `core:event:allow-listen` 等），并加了两条回归测试钉住它；同时**把前端报错回传到引擎日志**（`ui_log` 命令 + `window.onerror`），以后再出这类问题第一时间可见 |
+| 11 | **Tauri v2 的权限系统会让前端静默白屏**：没有 `capabilities` 声明时 `event.listen` 被拒，初始化整段中断，页面只剩空白，而且原因不出现在任何日志里 | 新增 `src-tauri/capabilities/default.json`（含 `core:event:allow-listen` 等），并加了两条回归测试钉住它；同时**把前端报错回传到引擎日志**（`ui_log` 命令）。2026-10-13 前端重写为 React 后，这条链路变成三处显式出口：`window.onerror`、未处理的 Promise 拒绝、以及每个视图外面的错误边界 —— 白屏被替换成一条可读的报错 |
 
 ### 19.3 有意保留的偏差
 

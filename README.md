@@ -68,27 +68,41 @@ echo status | nc -U /var/lib/hiveproxy/data/hiveproxy.sock
 │   │   └── zone.rs            网段重叠消歧（§9.3 情形二）
 ├── crates/hiveproxy-cli/      无界面命令行版本（服务器 / 容器 / systemd）
 ├── src-tauri/                 Tauri v2 桌面壳（只做事件转发与命令暴露）
-└── ui/                        静态前端：左侧菜单 + SVG 拓扑 DAG + 配置表单（无构建步骤）
+├── src/                       前端源码（React + TypeScript）
+│   ├── main.tsx / App.tsx     入口、三栏布局、视图路由
+│   ├── lib/                   与 core 的类型契约（types.ts 是 view.rs 的手写镜像）、IPC 封装、格式化
+│   ├── state/                 引擎状态在前端的唯一落点：store、动作、事件桥、轮询
+│   ├── components/            排版元件：侧栏、标题栏、面板、列表编辑器、错误边界
+│   ├── views/                 五个页面：概览 / 拓扑（含 SVG DAG）/ 规则 / 配置 / 日志
+│   └── styles/                设计令牌 + 通用块 + 页面样式
+├── index.html                 Vite 入口
+├── vite.config.ts             前端构建配置
+└── package.json               前端依赖与脚本
 ```
+
+前端的类型契约是**手写**的：`crates/hiveproxy-core/src/view.rs` 改了，`src/lib/types.ts` 就要跟着改。
+这么做的理由与前端整体一致 —— core 不依赖任何 UI 框架，前端也只在 §6.7 的事件/命令契约上依赖它，
+换掉整个前端不需要动 `hiveproxy-core` 一行。
 
 ## 构建与运行
 
-需要 Rust 1.75+ 与（Windows 上）系统自带的 WebView2。
+需要 Rust 1.75+、[Bun](https://bun.sh)（前端构建）与（Windows 上）系统自带的 WebView2。
 
 ```bash
-# 跑全部测试（含端到端组网）
-cargo test --workspace
+bun install                  # 装前端依赖
 
-# 编译桌面应用（首次会拉取较多依赖）
-cargo build -p hiveproxy-app --release
+bun run tauri dev            # 开发：Vite dev server + Tauri 窗口
+bun run tauri build          # 打包桌面版（先 bun run build，再走 Rust 的 release 构建）
+bun run build                # 只构建前端 → dist/（tsc 类型检查 + vite build）
+bun run typecheck            # 只做类型检查
 
-# 编译命令行版本
-cargo build -p hiveproxy-cli --release
-
-# 运行
-./target/release/hiveproxy            # 桌面版
-./target/release/hiveproxy-cli run    # 命令行版
+cargo test --workspace                   # 跑全部测试（含端到端组网）
+cargo build -p hiveproxy-cli --release   # 编译命令行版本
+./target/release/hiveproxy-cli run
 ```
+
+`tauri.conf.json` 的 `frontendDist` 指向 `dist/`，所以**直接 `cargo build -p hiveproxy-app`
+之前要先 `bun run build`** —— 那个目录不存在时 Tauri 的构建脚本会直接报错。
 
 数据目录（配置、持久化状态）：
 
@@ -134,12 +148,17 @@ split-horizon DNS —— 同一个域名在不同网段解析结果不同。
 所以 `RUST_LOG=info hiveproxy` 的终端输出里能看到浏览器侧的问题：
 
 ```
-INFO  hiveproxy: ui: 界面渲染完成：服务 运行中，卡片 12，节点 1，规则 0（本地），自检通过视图 [拓扑 规则 分区 配置 日志]
+INFO  hiveproxy: ui: 界面渲染完成：服务 运行中，节点 1，本地规则 0
 ```
 
-启动时每个视图的渲染函数都会先跑一遍自检，切页前就能发现渲染错误。
+界面用 React 重写后，"白屏"这条路被堵成了三处可读的报错：`window.onerror`、未处理的
+Promise 拒绝、以及每个视图外面的**错误边界**（某个视图渲染崩溃时，报错进引擎日志、
+界面显示错误详情而不是一片空白）。
 
 ## 状态
 
 引擎已完整实现并通过测试（单元 + 端到端组网）。未实现的部分在
 [docs/DESIGN.md](docs/DESIGN.md) §18 的决策表与 §17 风险里有明确记录。
+
+桌面端前端是 React + TypeScript + Vite（`src/`），与引擎之间只有 §6.7 的事件/命令契约：
+构建产物 `dist/` 由 Tauri 载入，全程不需要网络（`bun install` 之后即可离线构建）。
