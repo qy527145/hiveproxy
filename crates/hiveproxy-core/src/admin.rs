@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::node::HiveNode;
+use crate::proto::NodeId;
 use crate::rules::Rule;
 
 /// 处理一条请求行，返回一行响应。
@@ -68,6 +69,56 @@ async fn json_response(node: &Arc<HiveNode>, v: &Value) -> String {
                 Err(e) => err(e),
             },
             None => err("缺少 target"),
+        },
+        "probe_exits" => match arg("target") {
+            Some(t) => match node.probe_exits(&t) {
+                Ok(list) => ok(serde_json::to_value(list).unwrap_or(Value::Null)),
+                Err(e) => err(e),
+            },
+            None => err("缺少 target"),
+        },
+        "probe_dial" => match (arg("target"), arg("via")) {
+            (Some(t), Some(v)) => match v.parse::<NodeId>() {
+                Ok(id) => match node.probe_dial(&t, id).await {
+                    Ok(r) => ok(serde_json::to_value(r).unwrap_or(Value::Null)),
+                    Err(e) => err(e),
+                },
+                Err(_) => err(format!("`{v}` 不是合法节点地址")),
+            },
+            _ => err("缺少 target 或 via"),
+        },
+        // 逐行校验：收原始规则数组（与 set_rules 同一个形态），回出错的行
+        "check_rules" => match v.get("rules").cloned() {
+            Some(rj) => match serde_json::from_value::<Vec<crate::rules::RawRule>>(rj) {
+                Ok(rows) => ok(serde_json::to_value(node.check_rules(rows)).unwrap_or(Value::Null)),
+                Err(e) => err(format!("规则解析失败：{e}")),
+            },
+            None => err("缺少 rules"),
+        },
+        "default_egress" => match v.get("value") {
+            // 不带 value = 只读
+            None => ok(json!(node
+                .config()
+                .route
+                .default_egress
+                .map(|e| e.to_config_string()))),
+            Some(val) => {
+                let text = val.as_str().map(|s| s.to_string());
+                if val.is_null() || text.as_deref() == Some("none") {
+                    match node.set_default_egress(None) {
+                        Ok(()) => ok(json!(Value::Null)),
+                        Err(e) => err(e),
+                    }
+                } else {
+                    match text {
+                        Some(t) => match node.set_default_egress(Some(&t)) {
+                            Ok(()) => ok(json!(t)),
+                            Err(e) => err(e),
+                        },
+                        None => err("value 必须是字符串或 null"),
+                    }
+                }
+            }
         },
         "set_rules" => match v.get("rules").cloned() {
             Some(rj) => match serde_json::from_value::<Vec<Rule>>(rj) {
@@ -147,18 +198,81 @@ async fn text_command(node: &Arc<HiveNode>, line: &str) -> String {
         "probe" => match rest.first() {
             Some(t) => match node.probe_target(t).await {
                 Ok(r) => format!(
-                    "目标      {}\n出口      {}{}\n命中规则  {}\n",
+                    "目标      {}\n出口      {}{}\n来源      {}\n",
                     r.target,
                     r.egress,
                     if r.direct { "（本机直连）" } else { "" },
-                    match r.matched_rule {
-                        None => "内置网段兜底行".to_string(),
-                        Some(i) => format!("#{}", i + 1),
-                    }
+                    via_label(&r),
                 ),
                 Err(e) => err(e),
             },
             None => err("用法：probe <ip:port>"),
+        },
+        // 候选出口清单（§18 第 31 条）：成本、跳数、是否声明该网段、哪个是自动选中
+        "probe-exits" => match rest.first() {
+            Some(t) => match node.probe_exits(t) {
+                Ok(list) => {
+                    let mut s = format!("目标 {t} 的候选出口（共 {} 个）：\n", list.len());
+                    for c in &list {
+                        s.push_str(&format!(
+                            "  {}{}  {}  {}{}\n",
+                            if c.selected { "●" } else { "○" },
+                            c.node,
+                            c.alias.as_ref().map(|a| format!("（{a}）")).unwrap_or_default(),
+                            match (c.cost, c.hops) {
+                                (Some(cost), Some(h)) =>
+                                    format!("{} 跳 成本 {cost}", if c.is_self { 0 } else { h }),
+                                _ => "不可达".to_string(),
+                            },
+                            match (&c.unusable, c.declares_target, c.is_self) {
+                                (Some(why), _, _) => format!("  ✗ {why}"),
+                                (None, true, _) => "  ← 它自己的网段里就有这个 IP".to_string(),
+                                (None, _, true) => "  ← 本机直连".to_string(),
+                                _ => String::new(),
+                            }
+                        ));
+                    }
+                    s
+                }
+                Err(e) => err(e),
+            },
+            None => err("用法：probe-exits <ip:port>"),
+        },
+        // 实测：让该出口真的连一次目标（会在网络上产生一次真实连接）
+        "dial" => match (rest.first(), rest.get(2)) {
+            (Some(t), Some(via)) if rest.get(1).map(|s| s.as_ref()) == Some("via") => {
+                match via.parse::<NodeId>() {
+                    Ok(id) => match node.probe_dial(t, id).await {
+                        Ok(r) => format!(
+                            "{}  {}\n出口  {}{}\n耗时  {} ms\n",
+                            if r.ok { "✓ 通了" } else { "✗ 不通" },
+                            r.detail,
+                            r.via,
+                            if r.direct { "（本机直连）" } else { "" },
+                            r.rtt_ms
+                        ),
+                        Err(e) => err(e),
+                    },
+                    Err(_) => err(format!("`{via}` 不是合法节点地址")),
+                }
+            }
+            _ => err("用法：dial <ip:port> via <节点地址>"),
+        },
+        "default-egress" => match rest.first() {
+            None => {
+                let cur = node
+                    .config()
+                    .route
+                    .default_egress
+                    .map(|e| e.to_config_string())
+                    .unwrap_or_else(|| "（未设置）".into());
+                format!("默认出口    {cur}\n")
+            }
+            Some(v) => match node.set_default_egress(Some(v)) {
+                Ok(()) if matches!(v.trim(), "none" | "clear" | "") => "默认出口已清除\n".to_string(),
+                Ok(()) => format!("默认出口已设为 {v}\n"),
+                Err(e) => err(e),
+            },
         },
         "rules-enabled" => match rest.first() {
             Some(v) => {
@@ -210,6 +324,9 @@ const HELP: &str = "\
   streams             活跃流
   zones               网段真冲突与区域号
   probe <ip:port>     这个目标会走哪个出口
+  probe-exits <ip:port> 候选出口清单（成本 / 跳数 / 是否声明该网段）
+  dial <ip:port> via <节点>  实测：让该出口真的连一次目标（会产生真实连接）
+  default-egress [<出口>|none]  读 / 写默认出口
   reload              重新读取 hiveproxy.toml 并热更新
   publish             把当前本地规则整份发布到全网
   revoke              撤回共享规则集
@@ -219,9 +336,22 @@ const HELP: &str = "\
   help                本帮助
 
 JSON 命令：status / topology / stats / zones / groups / rules / shared_rules /
-  rule_stats / config / streams / probe / set_rules / publish_rules /
-  revoke_shared_rules / rules_enabled / add_seed / remove_seed / shutdown
+  rule_stats / config / streams / probe / probe_exits / probe_dial / check_rules /
+  default_egress / set_rules / publish_rules / revoke_shared_rules / rules_enabled /
+  add_seed / remove_seed / shutdown
 ";
+
+/// 探测结果里"出口是怎么定下来的"那行文字。
+fn via_label(r: &crate::view::StreamProbe) -> String {
+    match r.via.as_str() {
+        "rule" => match r.matched_rule {
+            Some(i) => format!("规则 #{}", i + 1),
+            None => "规则".to_string(),
+        },
+        "default" => "默认出口（route.default_egress）".to_string(),
+        _ => "内置网段兜底行".to_string(),
+    }
+}
 
 fn human_status(node: &Arc<HiveNode>) -> String {
     let st = node.status();
@@ -606,9 +736,94 @@ mod tests {
     async fn help_lists_commands() {
         let (n, dir) = node().await;
         let out = handle_line(&n, "help").await;
-        for c in ["status", "nodes", "rules", "probe", "publish", "reload"] {
+        for c in [
+            "status",
+            "nodes",
+            "rules",
+            "probe",
+            "probe-exits",
+            "dial",
+            "default-egress",
+            "check_rules",
+            "publish",
+            "reload",
+        ] {
             assert!(out.contains(c), "help 里应当列出 {c}");
         }
+        n.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn default_egress_over_the_wire() {
+        let (n, dir) = node().await;
+
+        // 不带参数 = 只读
+        let out = handle_line(&n, "default-egress").await;
+        assert!(out.contains("未设置"), "{out}");
+
+        // 写入（`node.set_default_egress` 是界面/CLI 共用的那条路径）
+        let out = handle_line(&n, "default-egress 10.0.0.5").await;
+        assert!(out.contains("已设为"), "{out}");
+        let back = handle_line(&n, r#"{"cmd":"default_egress"}"#).await;
+        assert_eq!(serde_json::from_str::<Value>(&back).unwrap()["data"], "node:10.0.0.5");
+
+        // 清除
+        let out = handle_line(&n, "default-egress none").await;
+        assert!(out.contains("已清除"), "{out}");
+        assert!(n.config().route.default_egress.is_none());
+
+        // 非法取值必须报错，而不是静默收下
+        let out = handle_line(&n, "default-egress auto").await;
+        assert!(serde_json::from_str::<Value>(&out).unwrap()["ok"] == false, "{out}");
+
+        n.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn probe_exits_over_the_wire_lists_at_least_self() {
+        let (n, dir) = node().await;
+        let out = handle_line(&n, r#"{"cmd":"probe_exits","target":"10.4.0.7:3389"}"#).await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true, "{out}");
+        let list = v["data"].as_array().unwrap();
+        assert!(list.iter().any(|c| c["is_self"] == true), "本机直连必须在候选里: {out}");
+        n.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dial_text_form_parses_target_and_via() {
+        let (n, dir) = node().await;
+
+        // 笨写法（少了 `via`）必须报用法错，而不是把第二个参数当成目标的一部分
+        let out = handle_line(&n, "dial 127.0.0.1:9 127.0.0.1").await;
+        assert!(out.contains("用法"), "{out}");
+
+        // 实测一个**没人监听**的端口：必须回一条"不通"，而不是 panic 或空白
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = l.local_addr().unwrap();
+        drop(l);
+        let out = handle_line(&n, &format!("dial {dead} via 127.0.0.1")).await;
+        assert!(out.contains("不通"), "{out}");
+
+        n.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn check_rules_over_the_wire_names_the_row() {
+        let (n, dir) = node().await;
+        let out = handle_line(
+            &n,
+            r#"{"cmd":"check_rules","rules":[{"host":"10.1.2.9:8080","port":"*","egress":"auto"}]}"#,
+        )
+        .await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true, "{out}");
+        assert_eq!(v["data"][0]["index"], 0);
+        assert_eq!(v["data"][0]["field"], "host");
         n.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -651,18 +866,37 @@ mod tests {
         let (r, mut w) = tokio::io::split(s);
         let mut lines = BufReader::new(r).lines();
 
+        // 响应是**多行**的，以一个空行收尾（§20.2）—— 所以不能只读一行：
+        // 只读一行会把剩下的行留在缓冲区里，下一条请求读到的是上一条的残渣。
+        // （这个测试一直这么坏着：它把 `status` 输出的第二行当成 JSON 去解析。）
         w.write_all(b"status\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().unwrap();
-        assert!(line.contains("127.0.0.1"), "{line}");
+        let text = read_response(&mut lines).await;
+        assert!(text[0].contains("127.0.0.1"), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("SOCKS5")), "多行输出要能完整读到: {text:?}");
 
         w.write_all(br#"{"cmd":"status"}"#).await.unwrap();
         w.write_all(b"\n").await.unwrap();
-        let line = lines.next_line().await.unwrap().unwrap();
-        let v: Value = serde_json::from_str(&line).unwrap();
+        let json = read_response(&mut lines).await;
+        let v: Value = serde_json::from_str(&json[0]).unwrap();
         assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["node_id"], "127.0.0.1");
 
         cancel.cancel();
         n.stop().await;
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 读到空行（响应终止符）为止，返回非空行。
+    async fn read_response<R: tokio::io::AsyncRead + Unpin>(
+        lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(l) = lines.next_line().await.unwrap() {
+            if l.is_empty() {
+                break;
+            }
+            out.push(l);
+        }
+        out
     }
 }

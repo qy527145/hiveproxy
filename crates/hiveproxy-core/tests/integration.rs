@@ -301,3 +301,169 @@ async fn block_rule_is_enforced_at_the_entry() {
     node.stop().await;
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 默认出口端到端（§9.4.4、§18 第 29 条、UI.md §2.3）。
+///
+/// 盯三件事：
+/// 1. **没有默认出口时，域名目标必须失败**（而不是悄悄直连）—— 浏览器流量全在这一格里，
+///    这正是"默认出口"存在的理由；
+/// 2. 设上 `default_egress = "direct"` 后，同一个请求成功，数据逐字节回来；
+/// 3. 域名解析出**多个**地址时（`localhost` → `::1` + `127.0.0.1`，而 echo 只监听 IPv4），
+///    本机直连要逐个试，不能取第一个就报"连接被拒"。
+///
+/// 第 3 条是这次顺带修掉的老毛病：默认出口让"域名 → 直连"从罕见变成常见，
+/// 于是 `handle_direct` 只取 `lookup_host().next()` 的写法开始天天见人。
+#[tokio::test]
+async fn default_egress_carries_a_domain_target() {
+    let echo_port = spawn_echo().await;
+    let dir = temp_dir("default-egress");
+    let port = free_port().await;
+    let cfg = base_cfg("fd00::1", port);
+    let node = HiveNode::start(cfg, &dir).await.unwrap();
+
+    let nn = node.clone();
+    wait_for(|| nn.state.socks5_bound.read().is_some(), 3000, "SOCKS5 端口就绪").await;
+    let socks = node.state.socks5_bound.read().expect("SOCKS5 应当已绑定");
+    // 用**域名**而不是 IP：域名永远不参与网段匹配（§9.4.2），所以它必然落到最后那一格
+    let target = format!("localhost:{echo_port}");
+
+    // ---- 1. 没有默认出口：没人认识这个目标，只能失败 ----
+    let (_c, rep) = socks5_connect(socks, &target).await;
+    assert_ne!(rep, 0x00, "没有默认出口时不该成功（实际应答码 {rep:#04x}）");
+
+    // ---- 2. 设默认出口（走的是 CLI / 界面用的那条真实路径）----
+    node.set_default_egress(Some("direct")).expect("direct 是合法的默认出口");
+    assert_eq!(node.status().default_egress.as_deref(), Some("direct"));
+
+    let (mut c, rep) = socks5_connect(socks, &target).await;
+    assert_eq!(rep, 0x00, "设了默认出口后应当成功（实际应答码 {rep:#04x}）");
+    let payload = b"hello through the default egress";
+    c.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf))
+        .await
+        .expect("echo 应当在 5 秒内回来")
+        .expect("读取 echo 结果失败");
+    assert_eq!(&buf, payload, "往返数据必须逐字节一致");
+    let _ = c.shutdown().await;
+
+    // ---- 3. 探测能说清"这个出口是怎么定下来的" ----
+    let p = node.probe_target(&target).await.unwrap();
+    assert_eq!(p.via, "default", "来源必须报成默认出口，而不是网段兜底行");
+    assert!(p.direct);
+
+    // ---- 4. auto / block 不是合法的默认出口 ----
+    assert!(node.set_default_egress(Some("auto")).is_err());
+    assert!(node.set_default_egress(Some("block")).is_err());
+
+    // ---- 5. 清除后又回到失败（证明成功确实来自默认出口）----
+    node.set_default_egress(None).unwrap();
+    let (_c2, rep) = socks5_connect(socks, &target).await;
+    assert_ne!(rep, 0x00, "清除默认出口后应当重新失败（实际应答码 {rep:#04x}）");
+
+    node.stop().await;
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 默认出口指向**另一台机器**时的完整链路：
+/// `客户端 → A(SOCKS5) → overlay → B（默认出口）→ echo`，且目标写成**域名**。
+///
+/// 这条是本产品的主线故事：浏览器要走的域名从"有出网权限的那台机器"出去。
+/// 它同时压住三个容易退化的点：
+/// 1. 默认出口是 `node:<对端>` 而不是本机直连时，`resolve()` 要走 overlay 那条分支；
+/// 2. **域名在出口侧解析**（§9.4.2），不是发起方解析；
+/// 3. 出口侧解析出多个地址时要逐个试 —— `localhost` 通常是 `::1` + `127.0.0.1`，
+///    而 echo 只监听 IPv4。只取第一个地址的写法在这里必然失败（2026-10-13 修的就是它）。
+#[tokio::test]
+async fn default_egress_through_a_peer_carries_a_domain_target() {
+    let echo_port = spawn_echo().await;
+    let port_a = free_port().await;
+    let port_b = free_port().await;
+    let dir_a = temp_dir("defegress-peer-a");
+    let dir_b = temp_dir("defegress-peer-b");
+
+    let b = HiveNode::start(base_cfg("fd00::b", port_b), &dir_b).await.unwrap();
+
+    let mut cfg_a = base_cfg("fd00::a", port_a);
+    cfg_a.peers.seeds = vec![format!("[::1]:{port_b}")];
+    // 主线故事：不命中规则与网段的一律交给 B 出去
+    cfg_a.route.default_egress = Some(EgressTarget::Node("fd00::b".parse().unwrap()));
+    let a = HiveNode::start(cfg_a, &dir_a).await.unwrap();
+
+    let aa = a.clone();
+    wait_for(|| aa.state.socks5_bound.read().is_some(), 3000, "A 的 SOCKS5 端口就绪").await;
+    let aa2 = a.clone();
+    wait_for(
+        || {
+            aa2.topology()
+                .nodes
+                .iter()
+                .any(|n| n.peer == "fd00::b".parse().unwrap() && n.reachable)
+        },
+        8000,
+        "A 的拓扑里出现可达的 B",
+    )
+    .await;
+
+    let socks = a.state.socks5_bound.read().expect("A 的 SOCKS5 应当已绑定");
+    let target = format!("localhost:{echo_port}");
+
+    let (mut c, rep) = socks5_connect(socks, &target).await;
+    assert_eq!(rep, 0x00, "默认出口指向对端时应当成功（实际应答码 {rep:#04x}）");
+
+    let payload = b"hello through the peer egress";
+    c.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf))
+        .await
+        .expect("echo 应当在 5 秒内回来")
+        .expect("读取 echo 结果失败");
+    assert_eq!(&buf, payload, "往返数据必须逐字节一致");
+    let _ = c.shutdown().await;
+
+    // 字节确实流过 B（不是 A 自己直连了）
+    assert!(
+        b.stats().bytes_relayed_in > 0 || b.stats().bytes_relayed_out > 0,
+        "出口应当是 B"
+    );
+    assert_eq!(a.probe_target(&target).await.unwrap().via, "default");
+
+    a.stop().await;
+    b.stop().await;
+    std::fs::remove_dir_all(&dir_a).ok();
+    std::fs::remove_dir_all(&dir_b).ok();
+}
+
+/// **规则排在默认出口之前** —— 这是界面上"顺序：规则 → 网段 → 默认出口"那句承诺的实现。
+///
+/// 反过来的话，"默认出口"就成了一条谁都覆盖不了的兜底规则，规则页从此不可信。
+/// （"默认出口不抢网段目标"由 `resolver::tests::default_egress_never_beats_subnet_matching`
+/// 覆盖：那条要在集成测试里伪造一个"本机网段内的目标"，会比它要验证的东西更假。）
+#[tokio::test]
+async fn rules_still_win_over_the_default_egress() {
+    let dir = temp_dir("defegress-rules");
+    let port = free_port().await;
+    let mut cfg = base_cfg("fd00::1", port);
+    // 默认出口是"能出去"，但这条域名被显式拒绝 —— 拒绝必须赢
+    cfg.route.default_egress = Some(EgressTarget::SelfDirect);
+    cfg.route.rules = vec![Rule::new(
+        HostMatcher::parse("*.corp.example.com").unwrap(),
+        PortMatcher::Any,
+        EgressTarget::Block,
+    )];
+    let node = HiveNode::start(cfg, &dir).await.unwrap();
+
+    let nn = node.clone();
+    wait_for(|| nn.state.socks5_bound.read().is_some(), 3000, "SOCKS5 端口就绪").await;
+    let socks = node.state.socks5_bound.read().expect("SOCKS5 应当已绑定");
+
+    let (_c, rep) = socks5_connect(socks, "secret.corp.example.com:443").await;
+    assert_eq!(rep, 0x02, "规则必须排在默认出口之前（实际应答码 {rep:#04x}）");
+
+    // 同一台机器上，没被规则覆盖的域名照旧走默认出口
+    let p = node.probe_target("other.example.com:443").await.unwrap();
+    assert_eq!(p.via, "default");
+
+    node.stop().await;
+    std::fs::remove_dir_all(&dir).ok();
+}

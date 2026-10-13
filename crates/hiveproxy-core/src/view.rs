@@ -128,14 +128,64 @@ pub struct StatsSnapshot {
     pub dial_failures: u64,
 }
 
-/// 一个被测目标的探测结果（`open_stream_probe`）。
+/// 一个被测目标的探测结果（`probe_target`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamProbe {
     pub target: Endpoint,
     pub egress: NodeId,
     pub direct: bool,
+    /// 这个出口是怎么定下来的：`"rule"` | `"subnet"` | `"default"`（§9.4.4）。
+    pub via: String,
+    /// `via == "rule"` 时是命中的规则下标（0 基）；其它情况为 `null`。
     pub matched_rule: Option<usize>,
     pub rtt_ms: u32,
+}
+
+/// 一个**候选出口**（`probe_exits`）—— 探测卡列出"还能从哪儿走"的那张表。
+///
+/// 只做路由计算，不建流；要证据得用 `probe_dial`（§18 第 31 条）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExitCandidate {
+    pub node: NodeId,
+    pub alias: Option<String>,
+    /// 本机（选中它 = 直接 connect，不进 overlay）。
+    pub is_self: bool,
+    /// 路径成本；本机为 0。
+    pub cost: Option<u32>,
+    pub hops: Option<u8>,
+    /// 对端是否声明 `accepts_egress`（自己不适用，恒为 true）。
+    pub accepts_egress: bool,
+    /// 该节点声明共享的网段。
+    pub subnets: Vec<String>,
+    /// 目标 IP 是否落在它声明的网段里（域名目标恒为 false）。
+    pub declares_target: bool,
+    /// 当前解析结果选中的就是它。
+    pub selected: bool,
+    /// 不能选它的原因；`None` = 可用。
+    pub unusable: Option<String>,
+}
+
+/// 一次**实测**的结果（`probe_dial`）：让某个出口真的连一次目标再关掉。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DialResult {
+    pub target: String,
+    /// 被要求去连的那个节点（本机直连时就是自己）。
+    pub via: NodeId,
+    pub direct: bool,
+    pub ok: bool,
+    pub rtt_ms: u32,
+    /// 失败原因（成功时为 `"连接成功"` 这类短语，供界面直接显示）。
+    pub detail: String,
+}
+
+/// 一条规则的逐行校验结果（`check_rules` 的返回项）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuleIssue {
+    /// 行号（0 基），与前端草稿的行序一致。
+    pub index: usize,
+    /// 出问题的字段：`host` | `port` | `egress` | `on_unreachable`。
+    pub field: String,
+    pub message: String,
 }
 
 /// 发布结果。
@@ -183,6 +233,9 @@ pub struct NodeStatus {
     pub listen: Vec<String>,
     /// 本机**能直达**的网段（我自己的可达范围），与是否对外声明无关。
     pub subnets: Vec<String>,
+    /// 被排除、因而没算进 `subnets` 的地址（虚拟网卡 / `share.subnet_deny`），
+    /// 每行一句人话 —— 界面得能回答"我的网段去哪了"（§9.1）。
+    pub excluded_subnets: Vec<String>,
     /// 是否把上面的网段**广播**给全网（`share.auto_share_subnets`）。
     pub share_subnets: bool,
     pub accepts_egress: bool,
@@ -191,6 +244,8 @@ pub struct NodeStatus {
     pub rule_count: usize,
     pub shared_rule_count: usize,
     pub rules_enabled: bool,
+    /// 最后一顺位出口（`route.default_egress`）；`None` = 没设（§9.4.4）。
+    pub default_egress: Option<String>,
     pub uptime_secs: u64,
     pub version: String,
 }

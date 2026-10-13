@@ -9,7 +9,8 @@
 - 无中心服务端：拓扑靠 gossip 自发收敛，路径靠 Dijkstra 计算
 - 走通单向孔洞：A 能连 B、B 连不回 A 的环境下依然双向可用（复用那条 TCP 会话）
 
-完整的系统设计见 **[docs/DESIGN.md](docs/DESIGN.md)**；面向装机的操作说明见 **[docs/USAGE.md](docs/USAGE.md)**。
+完整的系统设计见 **[docs/DESIGN.md](docs/DESIGN.md)**；面向装机的操作说明见 **[docs/USAGE.md](docs/USAGE.md)**；
+界面（信息架构、首页快捷配置、规则页）见 **[docs/UI.md](docs/UI.md)**。
 
 ---
 

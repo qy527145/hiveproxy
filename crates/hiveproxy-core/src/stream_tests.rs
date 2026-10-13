@@ -320,11 +320,27 @@ async fn pump_recovers_credit_and_emits_window_updates() {
 }
 
 #[test]
-fn resolve_endpoint_handles_ip_directly() {
+fn resolve_endpoints_handles_ip_directly() {
     let ep = Endpoint::new(Host::Ip("10.4.0.9".parse().unwrap()), 3389);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let a = rt.block_on(resolve_endpoint(&ep)).unwrap();
-    assert_eq!(a.to_string(), "10.4.0.9:3389");
+    let a = rt.block_on(resolve_endpoints(&ep)).unwrap();
+    assert_eq!(a, vec!["10.4.0.9:3389".parse().unwrap()]);
+}
+
+#[test]
+fn resolve_endpoints_returns_every_address_for_a_name() {
+    // ★ 这里必须回**全部**地址：`localhost` 通常是 `::1` + `127.0.0.1`，
+    // 只取第一个的话，目标只监听 IPv4 时就会白报一次"连接被拒"（2026-10-13 修）。
+    let ep = Endpoint::new(Host::Name("localhost".into()), 9);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    match rt.block_on(resolve_endpoints(&ep)) {
+        Ok(addrs) => assert!(
+            addrs.iter().all(|a| a.port() == 9),
+            "端口必须原样带过去: {addrs:?}"
+        ),
+        // 有些环境没有 localhost 的解析结果（容器里很常见）—— 那不算失败
+        Err(e) => assert!(e.contains("无解析结果"), "{e}"),
+    }
 }
 
 #[tokio::test]

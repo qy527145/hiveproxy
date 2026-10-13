@@ -18,6 +18,10 @@
   --err: #e5657a;
   --info: #6ba7ff;
   --r: 10px;
+  /* 控件高度：输入框 / 下拉 / 按钮**必须一样高**。
+     差几像素、或者表头与单元格的内边距不一致，整页立刻显得劣质（2026-10-13 用户反馈）。 */
+  --ctl-h: 30px;
+  --ctl-r: 6px;
   --sidenav: 214px;
   --mono: "Cascadia Mono", "JetBrains Mono", Consolas, monospace;
 }

@@ -185,7 +185,7 @@ pub async fn handle_stream_open(state: Arc<HiveState>, frame: RawFrame) {
     }
 
     // ★ 域名在这里解析 —— split-horizon DNS 意味着调用方解析会走错路（§9.4.2）
-    let addr = match resolve_endpoint(&msg.endpoint).await {
+    let addrs = match resolve_endpoints(&msg.endpoint).await {
         Ok(a) => a,
         Err(e) => {
             send_ack(&state, origin, stream_id, false, 4, &format!("域名解析失败: {e}")).await;
@@ -193,16 +193,28 @@ pub async fn handle_stream_open(state: Arc<HiveState>, frame: RawFrame) {
         }
     };
 
-    let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            send_ack(&state, origin, stream_id, false, 5, &format!("连接被拒: {e}")).await;
-            return;
+    // 解析结果可能多个（`localhost` → `::1` + `127.0.0.1`），**逐个试**，别只取第一个：
+    // 目标只监听 IPv4 时，"取到 ::1 就报连接被拒"会让一条本来能通的流白失败。
+    let mut tcp: Option<TcpStream> = None;
+    let mut refused: Option<String> = None;
+    let mut timed_out = false;
+    for addr in &addrs {
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                tcp = Some(s);
+                break;
+            }
+            Ok(Err(e)) => refused = Some(format!("{addr}: {e}")),
+            Err(_) => timed_out = true,
         }
-        Err(_) => {
-            send_ack(&state, origin, stream_id, false, 6, "连接超时").await;
-            return;
-        }
+    }
+    let Some(tcp) = tcp else {
+        let (code, why) = match (&refused, timed_out) {
+            (Some(e), _) if !timed_out => (5, format!("连接被拒: {e}")),
+            _ => (6, "连接超时".to_string()),
+        };
+        send_ack(&state, origin, stream_id, false, code, &why).await;
+        return;
     };
 
     let key = StreamKey(origin, stream_id);
@@ -256,14 +268,22 @@ pub async fn handle_stream_open(state: Arc<HiveState>, frame: RawFrame) {
     });
 }
 
-async fn resolve_endpoint(ep: &Endpoint) -> Result<std::net::SocketAddr, String> {
+/// 目标 → **全部**候选地址（域名在出口侧解析，§9.4.2）。
+///
+/// 返回 `Vec` 而不是单个地址：一个域名解析出多个地址是常态，而调用方必须逐个去试。
+async fn resolve_endpoints(ep: &Endpoint) -> Result<Vec<std::net::SocketAddr>, String> {
     match &ep.host {
-        Host::Ip(ip) => Ok(std::net::SocketAddr::new(*ip, ep.port)),
+        Host::Ip(ip) => Ok(vec![std::net::SocketAddr::new(*ip, ep.port)]),
         Host::Name(name) => {
-            let mut it = tokio::net::lookup_host((name.as_str(), ep.port))
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((name.as_str(), ep.port))
                 .await
-                .map_err(|e| e.to_string())?;
-            it.next().ok_or_else(|| format!("{name} 无解析结果"))
+                .map_err(|e| e.to_string())?
+                .collect();
+            if addrs.is_empty() {
+                Err(format!("{name} 无解析结果"))
+            } else {
+                Ok(addrs)
+            }
         }
     }
 }

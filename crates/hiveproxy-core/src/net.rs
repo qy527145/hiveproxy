@@ -61,16 +61,113 @@ pub fn is_shareable(ip: IpAddr, net: &Option<IpNet>) -> bool {
     }
 }
 
+/// 默认**不**当成"本机网段"的地址范围。
+///
+/// `198.18.0.0/15` 是 RFC 2544 的基准测试段 —— Clash / Clash Verge / sing-box 这类工具的
+/// **TUN 假地址池默认就落在这里**（常见 `198.18.0.1/30`）。它不是真实网络：把它当成本机网段
+/// 广播出去，等于让全网把"某台机器上代理工具编出来的假 IP"当成一个可路由的网段。
+///
+/// 2026-10-13 由用户实测撞到：`本机可直达网段 10.10.12.66/22, 198.18.0.1/30`，
+/// 后者的网卡是 tun。取值可在 `share.subnet_deny` 里改。
+pub const DEFAULT_SUBNET_DENY: &[&str] = &["198.18.0.0/15"];
+
+/// 默认**不**当成"本机网段"的网卡名模式（结尾 `*` = 前缀匹配，否则精确匹配）。
+///
+/// 这些名字基本只出现在虚拟网卡上（TUN/TAP、容器桥、虚拟机网卡、零信任客户端）。
+/// **取舍写在明处**：如果你的真实内网访问本来就依赖某条隧道 —— macOS 上 WireGuard 也叫
+/// `utunN` —— 就把对应的模式从 `share.subnet_deny_ifaces` 里删掉。
+/// 这里排除的是**网段声明**（"这块地方我替大家去"），不是"我能不能连"。
+pub const DEFAULT_IFACE_DENY: &[&str] = &[
+    "tun*",
+    "tap*",
+    "utun*",
+    "wg*",
+    "wintun*",
+    "docker*",
+    "veth*",
+    "br-*",
+    "bridge*",
+    "vmnet*",
+    "vboxnet*",
+    "zt*",
+    "tailscale*",
+    "ipsec*",
+];
+
+/// 默认排除表的解析结果（每次调用现解析；表只有两三条，不值得加缓存）。
+pub fn default_subnet_deny() -> Vec<IpNet> {
+    DEFAULT_SUBNET_DENY.iter().filter_map(|s| s.parse().ok()).collect()
+}
+
+/// 默认网卡名排除表。
+pub fn default_iface_deny() -> Vec<String> {
+    DEFAULT_IFACE_DENY.iter().map(|s| s.to_string()).collect()
+}
+
+/// 网卡名是否命中模式表。唯一支持的元字符是**结尾的** `*`（前缀匹配）。
+pub fn iface_denied(name: &str, patterns: &[String]) -> bool {
+    let name = name.to_ascii_lowercase();
+    patterns.iter().any(|p| {
+        let p = p.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            return false;
+        }
+        match p.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => name == p,
+        }
+    })
+}
+
+/// 一次网卡扫描的结果。
+///
+/// `excluded` 是给界面看的：用户会问"我明明在 10.x 网段里，为什么界面说我没有网段"，
+/// 这条链路必须能自己回答，而不是让人去读源码（2026-10-13 的 TUN 事件就是这么发现的）。
+#[derive(Clone, Debug, Default)]
+pub struct SubnetScan {
+    /// 适合当"本机网段"的。
+    pub subnets: Vec<IpNet>,
+    /// 被排除的，每行一句人话。
+    pub excluded: Vec<String>,
+}
+
+/// 扫描网卡，推导"本机所在、且适合共享"的网段。
+pub fn scan_subnets(ifaces: &[Iface], deny_cidrs: &[IpNet], deny_ifaces: &[String]) -> SubnetScan {
+    let mut out = SubnetScan::default();
+    for i in ifaces {
+        let Some(net) = i.net else {
+            continue;
+        };
+        if !is_shareable(i.ip, &i.net) {
+            continue;
+        }
+        if iface_denied(&i.name, deny_ifaces) {
+            out.excluded.push(format!("{net}（{}：虚拟网卡，见 share.subnet_deny_ifaces）", i.name));
+            continue;
+        }
+        if deny_cidrs.iter().any(|d| d.contains(&i.ip)) {
+            out.excluded.push(format!("{net}（{}：落在 share.subnet_deny 里）", i.name));
+            continue;
+        }
+        out.subnets.push(net);
+    }
+    out.subnets.sort_by_key(|n| n.to_string());
+    out.subnets.dedup();
+    out.excluded.sort();
+    out.excluded.dedup();
+    out
+}
+
+/// 按默认规则扫描本机（`share.subnet_deny` / `share.subnet_deny_ifaces` 的默认值）。
+pub fn scan_local_subnets(deny_cidrs: &[IpNet], deny_ifaces: &[String]) -> SubnetScan {
+    scan_subnets(&list_interfaces(), deny_cidrs, deny_ifaces)
+}
+
 /// 本机所在、且**适合共享**的全部网段。这是 §9.1「自动共享本机所在子网」的数据源。
+///
+/// 用默认排除规则；带配置的版本见 [`scan_local_subnets`]。
 pub fn local_subnets() -> Vec<IpNet> {
-    let mut v: Vec<IpNet> = list_interfaces()
-        .into_iter()
-        .filter(|i| is_shareable(i.ip, &i.net))
-        .filter_map(|i| i.net)
-        .collect();
-    v.sort_by_key(|n| n.to_string());
-    v.dedup();
-    v
+    scan_local_subnets(&default_subnet_deny(), &default_iface_deny()).subnets
 }
 
 /// 本机主地址的近似判定。
@@ -79,7 +176,25 @@ pub fn local_subnets() -> Vec<IpNet> {
 /// 其次任意非回环 IPv4，最后任意非回环地址。**不保证**与真实的 default route 一致。
 /// 地址不固定或被判定错误的环境请显式配置 `node.overlay_addr`（§5.8）。
 pub fn primary_ip() -> Option<IpAddr> {
-    let ifaces: Vec<Iface> = list_interfaces().into_iter().filter(|i| !i.is_loopback).collect();
+    primary_ip_with(&list_interfaces(), &default_subnet_deny(), &default_iface_deny())
+}
+
+/// 同 [`primary_ip`]，但排除虚拟网卡与排除段 —— **身份不该落在 TUN 上**。
+///
+/// 全被排除时退回未过滤的那份：宁可挑一个可疑的地址，也不能让节点起不来。
+pub fn primary_ip_with(
+    ifaces: &[Iface],
+    deny_cidrs: &[IpNet],
+    deny_ifaces: &[String],
+) -> Option<IpAddr> {
+    let clean = ifaces
+        .iter()
+        .filter(|i| !iface_denied(&i.name, deny_ifaces))
+        .filter(|i| !deny_cidrs.iter().any(|d| d.contains(&i.ip)))
+        .cloned()
+        .collect::<Vec<Iface>>();
+    let pool: &[Iface] = if clean.is_empty() { ifaces } else { &clean };
+    let ifaces: Vec<Iface> = pool.iter().filter(|i| !i.is_loopback).cloned().collect();
 
     let v4s: Vec<Ipv4Addr> = ifaces
         .iter()
@@ -216,5 +331,57 @@ mod tests {
         }
         let _ = primary_ip();
         let _ = directed_broadcasts();
+    }
+
+    fn iface(name: &str, addr: &str) -> Iface {
+        let net: IpNet = addr.parse().unwrap();
+        Iface { name: name.to_string(), ip: net.addr(), net: Some(net), is_loopback: net.addr().is_loopback() }
+    }
+
+    #[test]
+    fn tun_interface_is_not_a_local_subnet() {
+        // 2026-10-13 用户实测：`本机可直达网段 10.10.12.66/22, 198.18.0.1/30` ——
+        // 后者的网卡是 tun（代理工具的假地址池），不是真实网络。
+        let ifaces = vec![
+            iface("en0", "10.10.12.66/22"),
+            iface("utun4", "198.18.0.1/30"),
+            iface("lo0", "127.0.0.1/8"),
+        ];
+        let scan = scan_subnets(&ifaces, &default_subnet_deny(), &default_iface_deny());
+        assert_eq!(scan.subnets, vec!["10.10.12.66/22".parse::<IpNet>().unwrap()]);
+        assert_eq!(scan.excluded.len(), 1, "{:?}", scan.excluded);
+        assert!(scan.excluded[0].contains("utun4"), "{:?}", scan.excluded);
+
+        // 只关掉网卡名规则，光靠地址范围也必须能排掉它（两条防线各自独立）
+        let scan2 = scan_subnets(&ifaces, &default_subnet_deny(), &[]);
+        assert_eq!(scan2.subnets, vec!["10.10.12.66/22".parse::<IpNet>().unwrap()]);
+        assert!(scan2.excluded[0].contains("subnet_deny"), "{:?}", scan2.excluded);
+    }
+
+    #[test]
+    fn iface_patterns_prefix_match_only_with_star() {
+        let p = |s: &str| vec![s.to_string()];
+        assert!(iface_denied("utun4", &p("utun*")));
+        assert!(iface_denied("Wintun", &p("wintun*")), "名字匹配大小写不敏感");
+        assert!(!iface_denied("en0", &p("utun*")));
+        assert!(iface_denied("en0", &p("en0")));
+        assert!(!iface_denied("en01", &p("en0")), "不带 * 就是精确匹配");
+        assert!(!iface_denied("en0", &vec!["".to_string()]), "空模式不匹配任何东西");
+    }
+
+    #[test]
+    fn primary_ip_skips_virtual_adapters() {
+        // 身份落在 TUN 上是灾难：全网的节点地址会变成一台代理工具的假地址。
+        let ifaces = vec![iface("utun4", "198.18.0.1/30"), iface("en0", "10.10.12.66/22")];
+        assert_eq!(
+            primary_ip_with(&ifaces, &default_subnet_deny(), &default_iface_deny()),
+            Some("10.10.12.66".parse().unwrap())
+        );
+        // 全被排除时退回未过滤的那份：宁可挑一个可疑地址，也不能让节点起不来
+        let only_tun = vec![iface("utun4", "198.18.0.1/30")];
+        assert_eq!(
+            primary_ip_with(&only_tun, &default_subnet_deny(), &default_iface_deny()),
+            Some("198.18.0.1".parse().unwrap())
+        );
     }
 }

@@ -123,9 +123,11 @@ button.power.stop {
   font-size: 11px;
   line-height: 1.7;
 }
+/* 标签列定宽，几行的**值**才会左对齐；nowrap 保证四字标签不在中间断开 */
 .kv .k {
   color: var(--dim2);
-  flex: 0 0 30px;
+  flex: 0 0 44px;
+  white-space: nowrap;
 }
 .kv .v {
   color: var(--fg);
@@ -365,4 +367,242 @@ pre.log {
 }
 .crash button {
   margin-top: 12px;
+}
+
+/* ── 首页：状态带 + 四张快捷卡（UI.md §2）─────────────────────────── */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 9px 13px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  font-size: 12.5px;
+  color: var(--dim);
+}
+.statusbar .sep {
+  color: var(--dim2);
+}
+.statusbar .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dim2);
+}
+.statusbar .dot.on {
+  background: var(--ok);
+}
+.statusbar .dot.err {
+  background: var(--err);
+}
+.statusbar .dot.off {
+  background: var(--dim2);
+}
+/* 状态带里那串"看起来像链接"的按钮（默认出口）：点一下跳规则页 */
+.linklike {
+  /* 状态带里那个"点一下跳规则页"的默认出口。它是**一行文字**，不是控件：
+     所以高度交回给行高（全局 button 的 30px 在这一行里反而会顶歪基线），
+     也不画那条点线下划线 —— 它在深色底上脏得很。 */
+  background: none;
+  border: none;
+  height: auto;
+  padding: 0;
+  color: var(--cyan);
+  font: inherit;
+  cursor: pointer;
+}
+.linklike:hover {
+  color: var(--fg);
+  text-decoration: underline;
+}
+
+.quickgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 14px;
+  align-items: start;
+  margin-top: 12px;
+}
+/* 探测卡与运行指标跨整行 —— 它们是"表格型"的内容，挤在半栏里没法看 */
+.quickgrid .span2,
+.panel.span2 {
+  grid-column: 1 / -1;
+}
+.quickgrid .panel {
+  margin: 0;
+}
+
+/* ── 规则页（UI.md §3）───────────────────────────────────────────── */
+/* 条件/端口都是"类型下拉 + 值输入"，值输入要能缩得很窄 */
+table.editable.rules td {
+  padding: 3px 4px;
+  vertical-align: top;
+}
+table.editable.rules td select,
+table.editable.rules td input[type="text"],
+table.editable.rules td input:not([type]) {
+  width: 100%;
+}
+/* 出错的那一行：整行描红 + 行内红字（不是"保存时才弹一句看不懂的话"） */
+tr.bad > td {
+  background: rgba(229, 101, 122, 0.07);
+}
+tr.bad > td:first-child {
+  box-shadow: inset 3px 0 0 var(--err);
+}
+.cellerr {
+  color: var(--err);
+  font-size: 11px;
+  line-height: 1.45;
+  margin-top: 3px;
+  white-space: normal;
+}
+/* 探测结果里被选中的那一行 */
+tr.sel > td {
+  background: rgba(79, 209, 197, 0.08);
+}
+.dialok {
+  color: var(--ok);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.dialbad {
+  color: var(--err);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+/* ── 规则页（UI.md §3）：照 SwitchyOmega 的「切换规则」做 ──────────────
+   一行 = 排序 │ 条件类型 │ 条件设置 │ 出口 │ 操作。控件少、留白多。
+
+   对齐是这一页的门面：表头与单元格用**同一个内边距**，每个单元格里的东西
+   竖着居中对齐（`vertical-align: middle` + 内部 flex），一行里所有控件同高。 */
+table.rules th,
+table.rules td {
+  padding: 7px;
+}
+/* ★ 顶部对齐，不是中齐：`条件设置` 那格下面常常还有一行提示或红字，
+   中齐会把它里面的输入框**整体抬高**，于是同一行的输入框与下拉看着就没对齐。
+   顶部对齐后，每格里的第一个控件都从同一条水平线起笔。 */
+table.rules td {
+  vertical-align: top;
+}
+/* 只让"主控件"（条件类型 / 条件设置 / 出口）占满整列。
+   **不要**写成 `table.rules select { width: 100% }` —— 展开的子行里也有下拉与输入框，
+   那样它们会各自占一整行，点开「⋯」后看到的就是一摞大框。 */
+table.rules .full {
+  width: 100%;
+}
+/* 单元格里的"一行几个控件"：用 flex 对齐，别靠 baseline 碰运气
+   （`td` 自己不能设成 flex —— 那就不是 table-cell 了，列宽会散架） */
+.ordcell > div,
+.opcell > div {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.opcell > div {
+  justify-content: flex-end;
+}
+/* 序号：小号灰字，不与按钮抢注意力。左对齐 —— 表头「排序」也是左对齐的，
+   两者从同一个位置起笔，整列才不别扭。 */
+.ordcell .ord {
+  min-width: 12px;
+  text-align: left;
+  color: var(--dim2);
+  font: 11px var(--mono);
+}
+/* 上下移拼成一组：两个独立圆角按钮并排会显得毛糙 */
+.mvpair {
+  display: inline-flex;
+}
+.mvpair button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.mvpair button:last-child {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+}
+.mvpair button {
+  padding: 0;
+  min-width: 26px;
+}
+.opcell button.mini {
+  min-width: 30px;
+}
+.opcell .mini.on {
+  border-color: var(--cyan);
+  color: var(--cyan);
+}
+/* 输入框下面那行"翻译成人话"的小灰字 —— 单框写法最需要它 */
+.rowhint {
+  color: var(--dim2);
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 3px;
+}
+.rowhint.warn {
+  color: var(--warn);
+}
+.rowhint code,
+.cellerr code {
+  color: var(--dim);
+  background: #0a0c11;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+/* 展开后的次要设置（启用 / 不可达时 / 备注） */
+tr.subrow > td {
+  background: var(--panel2);
+  padding: 8px 10px;
+}
+/* 表尾那两行只读的合成行（内置兜底、默认出口）与共享段 */
+table.rules tr.readonly > td {
+  background: transparent;
+  border-top: 1px dashed var(--line2);
+  color: var(--dim);
+  font-size: 11.5px;
+  padding: 5px 8px;
+}
+/* 出错的那一行：整行描红 + 行内红字（不是"保存时才弹一句看不懂的话"） */
+tr.bad > td {
+  background: rgba(229, 101, 122, 0.07);
+}
+tr.bad > td:first-child {
+  box-shadow: inset 3px 0 0 var(--err);
+}
+.cellerr {
+  color: var(--err);
+  font-size: 11px;
+  line-height: 1.45;
+  margin-top: 3px;
+  white-space: normal;
+}
+/* 自动保存的状态字：安静，但要在意的时候看得见 */
+.savestate {
+  color: var(--dim2);
+  font-size: 11.5px;
+  margin-right: 2px;
+}
+.savestate.saving {
+  color: var(--warn);
+}
+.savestate.saved {
+  color: var(--ok);
+}
+.savestate.blocked,
+.savestate.failed {
+  color: var(--err);
+}
+.savestate.offline {
+  color: var(--dim);
+}
+
+/* 次要表格（命中统计、候选集）不必横跨整屏：列被拉得太开会显得稀稀拉拉 */
+.tablewrap.tight {
+  max-width: 940px;
 }

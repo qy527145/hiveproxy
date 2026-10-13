@@ -130,6 +130,20 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
         hint: "非空时只共享这些端口；留空 = 不限端口",
       },
       {
+        path: "share.subnet_deny",
+        label: "subnet_deny",
+        type: "strlist",
+        placeholder: "用逗号分隔，默认 198.18.0.0/15",
+        hint: "不当成「本机网段」的地址范围。默认排除 198.18.0.0/15（RFC 2544 基准段）—— Clash / sing-box 这类代理工具的 TUN 假地址池就落在那儿，它不是真实网络",
+      },
+      {
+        path: "share.subnet_deny_ifaces",
+        label: "subnet_deny_ifaces",
+        type: "strlist",
+        placeholder: "用逗号分隔，如 tun*,utun*,wg*",
+        hint: "不当成「本机网段」的网卡名（结尾 * = 前缀匹配）。如果你的真实内网访问本来就依赖某条隧道（macOS 上 WireGuard 也叫 utun），把对应模式删掉即可 —— 这里排除的是「我替大家去」，不是「我能不能连」",
+      },
+      {
         path: "egress.allow_egress",
         label: "allow_egress",
         type: "bool",
@@ -187,7 +201,7 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
         label: "socks5_bind",
         type: "text",
         star: true,
-        hint: "本机应用要连的 SOCKS5 地址",
+        hint: "本机应用要连的 SOCKS5 地址。默认 127.0.0.1:1080（首页有快捷入口）",
       },
       {
         path: "proxy.allow_remote_socks",

@@ -214,6 +214,7 @@ pub async fn handle_client(state: Arc<HiveState>, mut client: TcpStream) -> Resu
             self_id: state.self_id(),
             alias_table: &aliases,
             groups: &cfg.route.groups,
+            default_egress: cfg.route.default_egress.as_ref(),
             island_filter: island.as_ref(),
         };
         resolver::resolve(&ctx, &target)
@@ -256,37 +257,44 @@ async fn handle_direct(
         target: target.to_string(),
         egress: state.self_id(),
         direct: true,
-        matched_rule: resolved.matched_rule,
+        matched_rule: resolved.source.rule_index(),
     });
 
-    let addr = match &target.host {
-        Host::Ip(ip) => SocketAddr::new(*ip, target.port),
+    // 域名在**本机**解析（这不是 SOCKS5 的 `socks5h`；`socks5h` 会把域名交给出口）。
+    // ★ 解析结果可能多个（典型：`localhost` → `::1` + `127.0.0.1`），必须**逐个试**，
+    // 不能只取第一个：目标只监听 IPv4 时，取到 `::1` 就会白报一个"连接被拒"。
+    let addrs: Vec<SocketAddr> = match &target.host {
+        Host::Ip(ip) => vec![SocketAddr::new(*ip, target.port)],
         Host::Name(n) => match tokio::net::lookup_host((n.as_str(), target.port)).await {
-            Ok(mut it) => match it.next() {
-                Some(a) => a,
-                None => {
-                    reply(&mut client, REP_HOST_UNREACH).await?;
-                    return Err(SocksError::Resolve(ResolveError::NoRoute));
-                }
-            },
-            Err(_) => {
-                reply(&mut client, REP_HOST_UNREACH).await?;
-                return Err(SocksError::Resolve(ResolveError::NoRoute));
-            }
+            Ok(it) => it.collect(),
+            Err(_) => Vec::new(),
         },
     };
+    if addrs.is_empty() {
+        reply(&mut client, REP_HOST_UNREACH).await?;
+        return Err(SocksError::Resolve(ResolveError::NoRoute));
+    }
 
-    let upstream = match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr)).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(_)) => {
-            reply(&mut client, REP_REFUSED).await?;
-            return Err(SocksError::Resolve(ResolveError::NoRoute));
+    let deadline = Duration::from_secs(10);
+    let mut upstream: Option<TcpStream> = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in &addrs {
+        match tokio::time::timeout(deadline, TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                upstream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => last_err = None, // 超时
         }
-        Err(_) => {
-            reply(&mut client, REP_HOST_UNREACH).await?;
-            return Err(SocksError::Resolve(ResolveError::NoRoute));
-        }
+    }
+    let Some(upstream) = upstream else {
+        let code = match &last_err {
+            Some(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => REP_REFUSED,
+            _ => REP_HOST_UNREACH,
+        };
+        reply(&mut client, code).await?;
+        return Err(SocksError::Resolve(ResolveError::NoRoute));
     };
     upstream.set_nodelay(true).ok();
 
@@ -317,7 +325,7 @@ async fn handle_overlay(
     egress: crate::proto::NodeId,
     resolved: Resolved,
 ) -> Result<(), SocksError> {
-    let opened = match stream::open_stream(state.clone(), target.clone(), egress, resolved.matched_rule)
+    let opened = match stream::open_stream(state.clone(), target.clone(), egress, resolved.source.rule_index())
         .await
     {
         Ok(o) => o,

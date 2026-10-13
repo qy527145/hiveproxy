@@ -91,10 +91,17 @@ export interface Rule {
   enabled: boolean;
 }
 
-/** 一条新增规则的默认值。 */
+/**
+ * 一条新增规则的默认值。
+ *
+ * `host = "*."` 是**故意的**：它解释成"域名后缀、但还没填后缀"，因此引擎会回一句
+ * "`*.` 后必须有域名后缀" —— 于是新行一出现就是"待填"，而**不会**被自动保存成一条
+ * 兜住所有目标的 `*:*` 规则（规则页是边改边存的，见 UI.md §3.5）。
+ * 想改成"任意"随时可以在条件类型里选，但那时是你显式选的。
+ */
 export const NEW_RULE: Rule = {
   label: "",
-  host: "*",
+  host: "*.",
   port: "*",
   egress: "auto",
   on_unreachable: "fallback",
@@ -195,13 +202,51 @@ export interface Endpoint {
   port: number;
 }
 
+/** 出口是怎么定下来的（Rust 侧 `MatchSource`，§9.4.4）。 */
+export type ProbeVia = "rule" | "subnet" | "default";
+
 export interface StreamProbe {
   target: Endpoint;
   egress: NodeId;
   direct: boolean;
-  /** `null` = 内置网段兜底行命中。 */
+  via: ProbeVia;
+  /** `via === "rule"` 时才有意义（0 基）。 */
   matched_rule: number | null;
   rtt_ms: number;
+}
+
+/** 一个候选出口（`probe_exits`）。纯路由计算，不含"真的通不通"。 */
+export interface ExitCandidate {
+  node: NodeId;
+  alias: string | null;
+  /** 本机（选中它 = 直接 connect，不进 overlay）。 */
+  is_self: boolean;
+  cost: number | null;
+  hops: number | null;
+  accepts_egress: boolean;
+  subnets: string[];
+  /** 目标 IP 是否落在它声明的网段里（域名目标恒为 false）。 */
+  declares_target: boolean;
+  selected: boolean;
+  /** 不能选它的原因；`null` = 可用。 */
+  unusable: string | null;
+}
+
+/** 一次实测（`probe_dial`）的结果：真的建了一次流，然后立刻关掉。 */
+export interface DialResult {
+  target: string;
+  via: NodeId;
+  direct: boolean;
+  ok: boolean;
+  rtt_ms: number;
+  detail: string;
+}
+
+/** 一条规则的逐行校验结果（`check_rules`）。 */
+export interface RuleIssue {
+  index: number;
+  field: "host" | "port" | "egress" | "on_unreachable" | string;
+  message: string;
 }
 
 export interface NodeStatus {
@@ -210,6 +255,8 @@ export interface NodeStatus {
   listen: string[];
   /** 本机**能直达**的网段，与是否对外声明无关。 */
   subnets: string[];
+  /** 被排除、因而不在 `subnets` 里的地址（虚拟网卡 / `share.subnet_deny`），界面要能解释。 */
+  excluded_subnets: string[];
   /** 是否把上面的网段**广播**给全网（`share.auto_share_subnets`）。 */
   share_subnets: boolean;
   accepts_egress: boolean;
@@ -218,6 +265,8 @@ export interface NodeStatus {
   rule_count: number;
   shared_rule_count: number;
   rules_enabled: boolean;
+  /** 最后一顺位出口；`null` = 没设（§9.4.4）。 */
+  default_egress: string | null;
   uptime_secs: number;
   version: string;
 }
@@ -311,6 +360,10 @@ export interface DiscoveryCfg {
 export interface ShareCfg {
   auto_share_subnets: boolean;
   share_ports_only: number[];
+  /** 不当成"本机网段"的地址范围（默认含 `198.18.0.0/15`：代理工具 TUN 的假地址池）。 */
+  subnet_deny: string[];
+  /** 不当成"本机网段"的网卡名模式（结尾 `*` = 前缀匹配）。 */
+  subnet_deny_ifaces: string[];
 }
 
 export interface EgressCfg {
@@ -330,6 +383,8 @@ export interface RouteCfg {
   groups: GroupCfg[];
   accept_shared_rules: boolean;
   publish_enabled: boolean;
+  /** 规则与网段都没命中时的**最后一顺位**出口（§9.4.4）；缺字段与 `null` 等价。 */
+  default_egress?: string | null;
 }
 
 export interface ProxyCfg {

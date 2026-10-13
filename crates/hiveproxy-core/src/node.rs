@@ -23,12 +23,12 @@ use crate::msg::control_header;
 use crate::persist;
 use crate::proto::{Endpoint, Host, MsgType, NodeId, RuleSetAd};
 use crate::resolver::{self, Egress, ResolveCtx};
-use crate::rules::{EgressTarget, Rule};
+use crate::rules::{EgressTarget, HostMatcher, OnUnreachable, PortMatcher, RawRule, Rule};
 use crate::state::HiveState;
 use crate::stats::RuleHits;
 use crate::view::{
-    GroupView, NodeStatus, PublishResult, RulePreview, RuleStat, RulesView, StatsSnapshot,
-    StreamProbe, TopologySnapshot,
+    DialResult, ExitCandidate, GroupView, NodeStatus, PublishResult, RuleIssue, RulePreview,
+    RuleStat, RulesView, StatsSnapshot, StreamProbe, TopologySnapshot,
 };
 
 pub struct HiveNode {
@@ -129,6 +129,7 @@ impl HiveNode {
             alias: self.state.node.alias.clone(),
             listen: self.state.node.listen.iter().map(|a| a.to_string()).collect(),
             subnets: self.state.node.subnets.iter().map(|n| n.to_string()).collect(),
+            excluded_subnets: self.state.node.excluded_subnets.clone(),
             share_subnets: self.state.node.share_subnets,
             accepts_egress: cfg.egress.allow_egress,
             socks5_bind: cfg.proxy.socks5_bind.to_string(),
@@ -136,6 +137,7 @@ impl HiveNode {
             rule_count: rules.local_count,
             shared_rule_count: rules.merged.len().saturating_sub(rules.local_count),
             rules_enabled: rules.rules_enabled,
+            default_egress: cfg.route.default_egress.as_ref().map(|e| e.to_config_string()),
             uptime_secs: self.state.uptime_secs(),
             version: crate::VERSION.to_string(),
         }
@@ -264,6 +266,31 @@ impl HiveNode {
         self.state.config.store(Arc::new(cfg));
         self.state.rebuild_rules();
         self.state.emit_rules();
+        Ok(())
+    }
+
+    /// 设置 / 清除默认出口（`route.default_egress`，§9.4.4）。
+    ///
+    /// `None` 或 `"none"` = 清除。写法与规则的 `egress` 同一套，
+    /// 但 `auto` / `block` 在这里没有意义（`check_default_egress`）。
+    pub fn set_default_egress(&self, value: Option<&str>) -> Result<(), String> {
+        let mut cfg = self.state.cfg().as_ref().clone();
+        cfg.route.default_egress = match value.map(str::trim) {
+            None | Some("") | Some("none") | Some("clear") => None,
+            Some(v) => {
+                let t = EgressTarget::parse(v)?;
+                t.check_default_egress()?;
+                Some(t)
+            }
+        };
+        let shown = cfg
+            .route
+            .default_egress
+            .as_ref()
+            .map(|e| e.to_config_string())
+            .unwrap_or_else(|| "（已清除）".into());
+        self.set_config(cfg)?;
+        self.state.log("info", "route", format!("默认出口：{shown}"));
         Ok(())
     }
 
@@ -409,6 +436,7 @@ impl HiveNode {
             alias_table: &aliases,
             groups: &cfg.route.groups,
             island_filter: None,
+            default_egress: cfg.route.default_egress.as_ref(),
         };
         resolver::resolve(&ctx, t).ok().map(|r| r.egress)
     }
@@ -537,15 +565,238 @@ impl HiveNode {
             alias_table: &aliases,
             groups: &cfg.route.groups,
             island_filter: island.as_ref(),
+            default_egress: cfg.route.default_egress.as_ref(),
         };
-        let r = resolver::resolve(&ctx, &t).map_err(|e| format!("{e:?}"))?;
+        let r = resolver::resolve(&ctx, &t).map_err(|e| resolve_error_text(&e))?;
         Ok(StreamProbe {
             target: t,
             egress: r.dst_node(self.state.self_id()),
             direct: matches!(r.egress, Egress::Direct),
-            matched_rule: r.matched_rule,
+            via: r.source.as_str().to_string(),
+            matched_rule: r.source.rule_index(),
             rtt_ms: started.elapsed().as_millis() as u32,
         })
+    }
+
+    /// 列出这个目标的**候选出口**（§18 第 31 条）。
+    ///
+    /// 纯路由计算：成本、跳数、是否声明过目标网段、哪个是当前自动选中的。
+    /// "这条路真的通吗"是另一个问题，由 [`Self::probe_dial`] 回答。
+    pub fn probe_exits(&self, target: &str) -> Result<Vec<ExitCandidate>, String> {
+        let (_zone, t) = parse_target_zoned(target)?;
+        let cfg = self.state.cfg();
+        let topo = self.state.topology.read();
+        let router = self.state.router.read();
+        let rules = self.state.rules.read();
+        let aliases = self.state.aliases.read();
+        let self_id = self.state.self_id();
+
+        let ctx = ResolveCtx {
+            rules: &rules,
+            topo: &topo,
+            router: &router,
+            self_id,
+            alias_table: &aliases,
+            groups: &cfg.route.groups,
+            island_filter: None,
+            default_egress: cfg.route.default_egress.as_ref(),
+        };
+        let selected = resolver::resolve(&ctx, &t).ok();
+
+        let target_ip = match &t.host {
+            Host::Ip(ip) => Some(*ip),
+            Host::Name(_) => None,
+        };
+        let chosen = selected.as_ref().map(|s| s.dst_node(self_id));
+
+        // 某节点声明了哪些网段：`segments` 是唯一权威索引，反查一次即可（`NodeMeta` 里没有）。
+        let subnets_of = |id: &NodeId| -> Vec<String> {
+            let mut v: Vec<String> = topo
+                .segments
+                .iter()
+                .filter(|(_, owners)| owners.contains(id))
+                .map(|(net, _)| net.to_string())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let declares = |id: &NodeId| -> bool {
+            target_ip
+                .map(|ip| topo.segments_for_ip(ip).iter().any(|n| n == id))
+                .unwrap_or(false)
+        };
+
+        let mut out: Vec<ExitCandidate> = Vec::new();
+        for (id, meta) in topo.peers.iter() {
+            let route = router.route_to(*id);
+            let unusable = if route.is_none() {
+                Some("当前无路由".to_string())
+            } else if !meta.accepts_egress {
+                Some("对端声明不做出口（accepts_egress = false）".to_string())
+            } else {
+                None
+            };
+            out.push(ExitCandidate {
+                node: *id,
+                alias: meta.alias.clone(),
+                is_self: false,
+                cost: route.map(|r| r.cost),
+                hops: route.map(|r| r.hops),
+                accepts_egress: meta.accepts_egress,
+                subnets: subnets_of(id),
+                declares_target: declares(id),
+                selected: chosen == Some(*id),
+                unusable,
+            });
+        }
+        // 本机不一定在 `topo.peers` 里，而"本机直连"永远是一个候选 —— 补一行。
+        if !out.iter().any(|c| c.node == self_id) {
+            let mut subnets: Vec<String> =
+                self.state.node.subnets.iter().map(|n| n.to_string()).collect();
+            subnets.sort();
+            out.push(ExitCandidate {
+                node: self_id,
+                alias: self.state.node.alias.clone(),
+                is_self: true,
+                cost: Some(0),
+                hops: Some(0),
+                accepts_egress: true,
+                subnets,
+                declares_target: declares(&self_id),
+                selected: chosen == Some(self_id),
+                unusable: None,
+            });
+        } else if let Some(c) = out.iter_mut().find(|c| c.node == self_id) {
+            // 自己在拓扑里的那一行：成本恒为 0（§9.4.4），且永远可用。
+            c.is_self = true;
+            c.cost = Some(0);
+            c.hops = Some(0);
+            c.accepts_egress = true;
+            c.unusable = None;
+        }
+
+        // 排序：选中的排第一，然后可用的按 (成本, 地址)，最后不可用的。
+        out.sort_by_key(|c| (!c.selected, c.unusable.is_some(), c.cost.unwrap_or(u32::MAX), c.node));
+        Ok(out)
+    }
+
+    /// **实测**：让指定的出口真的连一次目标，然后立刻把流关掉（§18 第 31 条）。
+    ///
+    /// 这是唯一能回答"这条出口真的够得着吗"的办法 —— 路由算得出来不代表防火墙放行，
+    /// 也不代表出口那一侧能连上目标。**它会在网络上产生一次真实连接**，所以是手工动作。
+    pub async fn probe_dial(&self, target: &str, via: NodeId) -> Result<DialResult, String> {
+        let (_zone, t) = parse_target_zoned(target)?;
+        let self_id = self.state.self_id();
+        let direct = via == self_id;
+        let started = std::time::Instant::now();
+
+        if direct {
+            // 本机直连：不进 overlay，直接一个 TCP connect（域名在本机解析，
+            // 与 SOCKS5 的 handle_direct 同一条路径）。
+            let addrs: Vec<std::net::SocketAddr> = match &t.host {
+                Host::Ip(ip) => vec![std::net::SocketAddr::new(*ip, t.port)],
+                Host::Name(n) => tokio::net::lookup_host((n.as_str(), t.port))
+                    .await
+                    .map_err(|e| format!("域名解析失败：{e}"))?
+                    .collect(),
+            };
+            if addrs.is_empty() {
+                return Ok(DialResult {
+                    target: t.to_string(),
+                    via,
+                    direct,
+                    ok: false,
+                    rtt_ms: started.elapsed().as_millis() as u32,
+                    detail: "域名解析不到地址".into(),
+                });
+            }
+            let timeout = crate::stream::CONNECT_TIMEOUT;
+            let dial = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addrs[..])).await;
+            return Ok(match dial {
+                Ok(Ok(_)) => DialResult {
+                    target: t.to_string(),
+                    via,
+                    direct,
+                    ok: true,
+                    rtt_ms: started.elapsed().as_millis() as u32,
+                    detail: "本机直连成功".into(),
+                },
+                Ok(Err(e)) => DialResult {
+                    target: t.to_string(),
+                    via,
+                    direct,
+                    ok: false,
+                    rtt_ms: started.elapsed().as_millis() as u32,
+                    detail: format!("本机连接失败：{e}"),
+                },
+                Err(_) => DialResult {
+                    target: t.to_string(),
+                    via,
+                    direct,
+                    ok: false,
+                    rtt_ms: started.elapsed().as_millis() as u32,
+                    detail: "本机连接超时".into(),
+                },
+            });
+        }
+
+        // 经 overlay：让该出口去连（`open_stream` 等的是出口侧的 StreamAck，
+        // 也就是"它那边 connect 成没成"），拿到结果后立刻关流。
+        let opened = crate::stream::open_stream(self.state.clone(), t.clone(), via, None).await;
+        let rtt = started.elapsed().as_millis() as u32;
+        match opened {
+            Ok(o) => {
+                crate::stream::close_stream(
+                    &self.state,
+                    o.ctx.key,
+                    crate::proto::CloseReason::Normal,
+                )
+                .await;
+                Ok(DialResult {
+                    target: t.to_string(),
+                    via,
+                    direct,
+                    ok: true,
+                    rtt_ms: rtt,
+                    detail: "出口已连上目标".into(),
+                })
+            }
+            Err(e) => Ok(DialResult {
+                target: t.to_string(),
+                via,
+                direct,
+                ok: false,
+                rtt_ms: rtt,
+                detail: open_error_text(&e),
+            }),
+        }
+    }
+
+    /// 逐行校验一份**原始规则**（界面草稿的形态），返回出错的行（§18 第 32 条）。
+    ///
+    /// 为什么不让界面自己校验：解析规则的是引擎，在界面上再写一遍等于抄一遍语法 ——
+    /// 两份实现迟早对不上。这里把"哪一行、哪个字段、为什么"原样回给界面。
+    pub fn check_rules(&self, rows: Vec<RawRule>) -> Vec<RuleIssue> {
+        let mut out = Vec::new();
+        for (index, raw) in rows.iter().enumerate() {
+            let mut push = |field: &str, message: String| {
+                out.push(RuleIssue { index, field: field.to_string(), message });
+            };
+            if let Err(e) = HostMatcher::parse(&raw.host) {
+                push("host", e);
+            }
+            if let Err(e) = PortMatcher::parse(&raw.port.as_str()) {
+                push("port", e);
+            }
+            if let Err(e) = EgressTarget::parse(&raw.egress) {
+                push("egress", e);
+            }
+            if let Err(e) = OnUnreachable::parse(&raw.on_unreachable) {
+                push("on_unreachable", e);
+            }
+        }
+        out
     }
 
     /// 给某个 peer 发一个 Ping 并等 Pong（简化为：报告当前链路的 RTT 观测）。
@@ -659,6 +910,32 @@ pub fn parse_target(s: &str) -> Result<Endpoint, String> {
     parse_target_zoned(s).map(|(_, e)| e)
 }
 
+/// 解析失败的原因文本。
+///
+/// 早先这里是 `format!("{e:?}")` —— 界面上的报错就是一句 `NoRoute`，
+/// 既不是中文也不知道该改什么（§18 第 31 条同批修掉）。
+fn resolve_error_text(e: &resolver::ResolveError) -> String {
+    match e {
+        resolver::ResolveError::NoRoute => {
+            "无路由：目标不落在任何已知网段，也没有规则或默认出口接管".to_string()
+        }
+        resolver::ResolveError::Refused => "被规则显式拒绝（egress = block）".to_string(),
+    }
+}
+
+/// 实测失败的原因文本（`OpenError` 同样没有 `Display`）。
+fn open_error_text(e: &crate::stream::OpenError) -> String {
+    match e {
+        crate::stream::OpenError::SelfLoop => "目标是本机自己，应当走直连".to_string(),
+        crate::stream::OpenError::NoRoute => "到该出口当前没有路由".to_string(),
+        crate::stream::OpenError::Refused => "出口侧拒绝（egress = block）".to_string(),
+        crate::stream::OpenError::Timeout => "出口没有在超时内回应".to_string(),
+        crate::stream::OpenError::Rejected { code, reason } => {
+            format!("出口连不上目标（code {code}）：{reason}")
+        }
+    }
+}
+
 /// 统计与拓扑的周期事件泵。
 async fn stats_pump(state: Arc<HiveState>, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -702,6 +979,7 @@ pub fn init_config(base_dir: impl AsRef<Path>) -> Result<Config, ConfigError> {
 mod tests {
     use super::*;
     use crate::rules::{HostMatcher, PortMatcher};
+    use crate::testutil::nid;
 
     #[test]
     fn parse_target_forms() {
@@ -890,6 +1168,145 @@ mod tests {
         let p = node.preview_rules(rules);
         assert!(p.never_matched.contains(&1), "被完全覆盖的规则必须被标出来: {p:?}");
         assert!(p.blackholes.contains(&0), "block 规则是黑洞: {p:?}");
+
+        node.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 起一个只监听回环、不发现、不拨号的节点（新加的探测/默认出口测试共用）。
+    async fn start_test_node(tag: &str) -> (Arc<HiveNode>, PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("hiveproxy-{tag}-{}-{}", std::process::id(), now_unix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
+        cfg.listen.bind = "127.0.0.1".parse().unwrap();
+        cfg.listen.ports = vec![0];
+        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.discovery.lan_udp = false;
+        (HiveNode::start(cfg, &dir).await.unwrap(), dir)
+    }
+
+    #[tokio::test]
+    async fn default_egress_is_settable_persisted_and_visible_in_status() {
+        let (node, dir) = start_test_node("defegress").await;
+
+        node.set_default_egress(Some("10.0.0.5")).unwrap();
+        assert_eq!(node.status().default_egress.as_deref(), Some("node:10.0.0.5"));
+        // 落盘：重新读一遍磁盘上的配置
+        let saved = persist::load_config(&dir).unwrap();
+        assert_eq!(
+            saved.route.default_egress,
+            Some(EgressTarget::Node("10.0.0.5".parse().unwrap()))
+        );
+
+        // "none" = 清除
+        node.set_default_egress(Some("none")).unwrap();
+        assert!(node.status().default_egress.is_none());
+
+        // auto / block 在这里没有意义，必须报错而不是静默收下
+        assert!(node.set_default_egress(Some("auto")).is_err());
+        assert!(node.set_default_egress(Some("block")).is_err());
+        assert!(node.set_default_egress(Some("乱七八糟")).is_err());
+
+        node.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn check_rules_points_at_the_bad_row_and_field() {
+        let (node, dir) = start_test_node("checkrules").await;
+        let rows: Vec<RawRule> = serde_json::from_str(
+            r#"[
+              {"host":"*.corp.example.com","port":"443","egress":"direct"},
+              {"host":"10.1.2.9:8080","port":"*","egress":"auto"},
+              {"host":"10.9.0.0/33","port":"8000-7000","egress":"node:10.0.0.5"},
+              {"host":"10.9.1.0/24","port":"*","egress":"nod:10.0.0.5","on_unreachable":"fail"}
+            ]"#,
+        )
+        .unwrap();
+        let issues = node.check_rules(rows);
+
+        assert!(!issues.iter().any(|i| i.index == 0), "第 1 行是好的");
+        assert!(issues.iter().any(|i| i.index == 1 && i.field == "host"), "{issues:?}");
+        let third: Vec<&str> =
+            issues.iter().filter(|i| i.index == 2).map(|i| i.field.as_str()).collect();
+        assert!(third.contains(&"host") && third.contains(&"port"), "{issues:?}");
+        assert!(issues.iter().any(|i| i.index == 3 && i.field == "egress"), "{issues:?}");
+        // 每一条都要有话说，不能只报"错了"（§18 第 32 条：行内校验的意义就在这句人话里）
+        assert!(issues.iter().all(|i| !i.message.is_empty()));
+
+        node.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn probe_exits_lists_self_first_and_marks_the_declarer() {
+        let (node, dir) = start_test_node("probeexits").await;
+
+        // 手动塞一份拓扑：本机 -> 10.4.0.9（声明 10.4.0.0/24），另有一台不做出口的 10.0.0.7
+        let topo = crate::testutil::topology(
+            "127.0.0.1",
+            &[("127.0.0.1", "10.4.0.9"), ("127.0.0.1", "10.0.0.7")],
+            &[("10.4.0.9", "10.4.0.0/24")],
+            &["10.0.0.7"],
+        );
+        *node.state.topology.write() = topo;
+        node.state.rebuild_router();
+
+        let cands = node.probe_exits("10.4.0.7:3389").unwrap();
+        let self_row = cands.iter().find(|c| c.is_self).expect("本机直连必须在候选里");
+        assert_eq!(self_row.cost, Some(0), "自己永远是成本 0（§9.4.4）");
+        assert!(self_row.unusable.is_none());
+
+        let declarer = cands.iter().find(|c| c.node == nid("10.4.0.9")).unwrap();
+        assert!(declarer.declares_target, "它声明了目标所在的网段");
+        assert!(declarer.selected, "自动选中的应当就是它");
+        assert_eq!(cands[0].node, declarer.node, "选中的排第一");
+
+        let refuse = cands.iter().find(|c| c.node == nid("10.0.0.7")).unwrap();
+        assert!(refuse.unusable.is_some(), "不做出口的节点要给出理由，而不是消失");
+        assert!(!refuse.declares_target);
+
+        // 域名目标：没有人"声明"过它
+        let by_name = node.probe_exits("api.corp.example.com:443").unwrap();
+        assert!(by_name.iter().all(|c| !c.declares_target));
+
+        node.stop().await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn probe_dial_really_connects_or_reports_why_not() {
+        let (node, dir) = start_test_node("probedial").await;
+        let me = node.state.self_id();
+
+        // 真起一个本地监听，实测本机直连必须通
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let ok = node.probe_dial(&format!("127.0.0.1:{port}"), me).await.unwrap();
+        assert!(ok.ok, "本机直连应当成功：{}", ok.detail);
+        assert!(ok.direct);
+
+        // 没人监听的端口：报错，且要说人话（不是 `ConnectionRefused` 这种原文）
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let bad = node.probe_dial(&format!("127.0.0.1:{dead_port}"), me).await.unwrap();
+        assert!(!bad.ok);
+        assert!(bad.detail.contains("本机"), "{}", bad.detail);
+
+        // 走 overlay 但到不了那个节点：给的是"没有路由"，不是 panic
+        let unreachable = node.probe_dial("10.4.0.7:3389", nid("10.99.99.99")).await.unwrap();
+        assert!(!unreachable.ok);
+        assert!(!unreachable.direct);
 
         node.stop().await;
         std::fs::remove_dir_all(&dir).ok();

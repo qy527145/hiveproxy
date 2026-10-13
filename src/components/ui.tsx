@@ -10,9 +10,16 @@ export function Panel({
   hint,
   actions,
   children,
-}: PropsWithChildren<{ title?: ReactNode; hint?: ReactNode; actions?: ReactNode }>) {
+  className = "",
+}: PropsWithChildren<{
+  title?: ReactNode;
+  hint?: ReactNode;
+  actions?: ReactNode;
+  /** 额外的类名（首页的快捷卡用它做跨列）。 */
+  className?: string;
+}>) {
   return (
-    <section className="panel">
+    <section className={`panel ${className}`.trim()}>
       {(title || actions) && (
         <div className="row between">
           <div>
@@ -51,8 +58,8 @@ export function Empty({ children }: PropsWithChildren) {
   return <div className="empty">{children}</div>;
 }
 
-export function TableWrap({ children }: PropsWithChildren) {
-  return <div className="tablewrap">{children}</div>;
+export function TableWrap({ children, className = "" }: PropsWithChildren<{ className?: string }>) {
+  return <div className={`tablewrap ${className}`.trim()}>{children}</div>;
 }
 
 /** 卡片：概览页那一排指标。`tone` 决定数值颜色。 */

@@ -30,6 +30,11 @@ pub struct NodeIdentity {
     pub listen: Vec<SocketAddr>,
     /// 本机所在、适合共享的网段 —— **始终**填充，与本机配置无关。
     pub subnets: Vec<IpNet>,
+    /// 被排除、因而**没有**算进 `subnets` 的地址，每行一句人话（虚拟网卡 / 排除段）。
+    ///
+    /// 存在的理由很具体：用户会问"我明明在 10.x 里，为什么它说我没有网段"。
+    /// 界面必须能自己回答这个问题（§9.1、2026-10-13 的 TUN 事件）。
+    pub excluded_subnets: Vec<String>,
     /// 是否把 `subnets` 广播给全网（§9.1 的 `auto_share_subnets`）。
     pub share_subnets: bool,
     /// 是否愿意做出口（§9.4.4）。
@@ -55,13 +60,18 @@ impl NodeIdentity {
         // ★ `subnets` 与 `auto_share_subnets` **无关**：它描述的是"我自己能连什么"，
         // 而不是"我告诉别人什么"。早先把两者绑在一起，结果是敏感机器一关共享，
         // 连自己网段里的目标都访问不了了。
-        let mut subnets: Vec<IpNet> = net::local_subnets();
+        // 虚拟网卡与排除段不算"我的网段"（默认排掉 TUN/容器网卡与 RFC 2544 段，§9.1）。
+        let scan = net::scan_local_subnets(&cfg.share.deny_cidrs(), &cfg.share.deny_ifaces());
+        let mut subnets: Vec<IpNet> = scan.subnets;
+        let mut excluded: Vec<String> = scan.excluded;
         // 身份地址自身所在网段也要算进去（`overlay_addr` 覆盖时尤其重要）。
+        // **显式配置优先于排除表**：把身份钉在某个地址上，就是"我知道我在干什么"。
         for i in net::list_interfaces() {
             if i.ip == ip {
                 if let Some(n) = i.net {
-                    if n.prefix_len() <= 30 {
+                    if n.prefix_len() <= 30 && !subnets.contains(&n) {
                         subnets.push(n);
+                        excluded.retain(|e| !e.starts_with(&n.to_string()));
                     }
                 }
             }
@@ -76,6 +86,7 @@ impl NodeIdentity {
             alias: cfg.node.alias.clone().filter(|s| !s.is_empty()),
             listen,
             subnets,
+            excluded_subnets: excluded,
             share_subnets: cfg.share.auto_share_subnets,
             accepts_egress: cfg.egress.allow_egress,
         })

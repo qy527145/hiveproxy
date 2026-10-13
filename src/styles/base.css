@@ -9,6 +9,19 @@
   padding: 15px 16px;
   min-width: 0;
 }
+.panel > .row.between {
+  /* 标题/提示在左、动作在右。动作**不能**wrap 到提示下面去 ——
+     那会让"★ 改完需重启"这类标记看起来像正文漏了一行（首页快捷卡实测） */
+  flex-wrap: nowrap;
+}
+.panel > .row.between > div:first-child {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.panel > .row.between > .row.nowrap {
+  flex: 0 0 auto;
+}
+
 .panel h2 {
   margin: 0 0 6px;
   font-size: 13.5px;
@@ -141,6 +154,16 @@ td {
 tbody tr:last-child td {
   border-bottom: 0;
 }
+/* 表格内容与面板里的其它内容**左对齐**：单元格首列默认还有 8px 内边距，
+   于是表头与第一列的内容比上面的输入框/提示文字整体右移一点，看着就是"没对齐"。 */
+.panel table th:first-child,
+.panel table td:first-child {
+  padding-left: 0;
+}
+.panel table th:last-child,
+.panel table td:last-child {
+  padding-right: 0;
+}
 tbody tr:hover {
   background: #171c26;
 }
@@ -160,18 +183,32 @@ table.editable select {
   width: 100%;
 }
 
-/* ── 控件 ─────────────────────────────────────── */
+/* ── 控件 ───────────────────────────────────────
+   统一的高度节奏：输入框、下拉、按钮一律 `--ctl-h` 高、`--ctl-r` 圆角、同一个字号。
+   同一行里两种控件差 2px，看起来就是"没对齐"（2026-10-13）。 */
 input,
 select,
 textarea {
   background: var(--panel2);
   border: 1px solid var(--line2);
   color: var(--fg);
-  border-radius: 6px;
-  padding: 6px 9px;
-  font: inherit;
+  border-radius: var(--ctl-r);
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  padding: 0 9px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: normal;
   min-width: 0;
   width: 100%;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--dim2);
+}
+input:disabled,
+select:disabled {
+  opacity: 0.55;
 }
 input:focus,
 select:focus,
@@ -179,15 +216,22 @@ textarea:focus {
   outline: 1px solid var(--info);
   border-color: var(--info);
 }
-input[type="checkbox"] {
+input[type="checkbox"],
+input[type="radio"] {
   width: auto;
+  height: auto;
   accent-color: var(--accent);
+}
+/* 单选框用青色：它在本应用里表示"这一行被选中了"，与cyan 的 pill/高亮同一族 */
+input[type="radio"] {
+  accent-color: var(--cyan);
 }
 select {
   width: auto;
 }
 textarea {
   height: 320px;
+  padding: 8px 10px;
   font: 12px/1.55 var(--mono);
   resize: vertical;
 }
@@ -196,9 +240,13 @@ button {
   background: var(--panel2);
   color: var(--fg);
   border: 1px solid var(--line2);
-  border-radius: 6px;
-  padding: 6px 12px;
-  font: inherit;
+  border-radius: var(--ctl-r);
+  box-sizing: border-box;
+  height: var(--ctl-h);
+  padding: 0 12px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: normal;
   cursor: pointer;
   white-space: nowrap;
 }
@@ -221,8 +269,13 @@ button.danger {
 button.ghost {
   background: transparent;
 }
+/* 小按钮**也是** `--ctl-h` 高：它经常和输入框/下拉并排，矮一截就等着被说不齐。
+   内容用 flex 居中 —— ↑↓⋯✕ 这些符号靠基线碰运气会偏高偏低。 */
 button.mini {
-  padding: 2px 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
   font-size: 12px;
 }
 button:disabled {

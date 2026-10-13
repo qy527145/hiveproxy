@@ -14,9 +14,12 @@ import { onlyLocal, report } from "../lib/report";
 import { NEW_RULE } from "../lib/types";
 import type {
   Config,
+  DialResult,
+  ExitCandidate,
   GroupView,
   NodeStatus,
   Rule,
+  RuleIssue,
   RulePreview,
   RuleStat,
   RulesView,
@@ -253,6 +256,21 @@ export function probeTarget(target: string): Promise<CallResult<StreamProbe>> {
   return call<StreamProbe>("probe_target", { target });
 }
 
+/** 候选出口清单（§18 第 31 条）：纯路由计算，不建流。 */
+export function probeExits(target: string): Promise<CallResult<ExitCandidate[]>> {
+  return call<ExitCandidate[]>("probe_exits", { target });
+}
+
+/** 实测：让某个出口真的连一次目标再关掉。**会产生一次真实连接**。 */
+export function probeDial(target: string, via: string): Promise<CallResult<DialResult>> {
+  return call<DialResult>("probe_dial", { target, via });
+}
+
+/** 逐行校验规则草稿 —— 行内红字的来源（引擎解析，前端不重复实现一遍语法）。 */
+export function checkRules(rules: Rule[]): Promise<CallResult<RuleIssue[]>> {
+  return call<RuleIssue[]>("check_rules", { rules });
+}
+
 export function closeStream(peer: string, streamId: number): Promise<CallResult<void>> {
   return call<void>("close_stream", { peer, streamId });
 }
@@ -298,6 +316,11 @@ export function addRule(): void {
   setDraft([...draftRules(), { ...NEW_RULE }], true);
 }
 
+/** 追加一条**填好条件与出口**的草稿（首页"生成规则"用，UI.md §2.3）。 */
+export function addRuleWith(rule: Rule): void {
+  setDraft([...draftRules(), { ...rule }], true);
+}
+
 export function updateRuleField(index: number, field: keyof Rule, value: string | boolean): void {
   setDraft(
     draftRules().map((r, i) => (i === index ? ({ ...r, [field]: value } as Rule) : r)),
@@ -321,16 +344,25 @@ export function deleteRule(index: number): void {
   setDraft(rules, true);
 }
 
-export async function saveRules(): Promise<void> {
+/**
+ * 保存本地规则。
+ *
+ * `silent` = **自动保存**路径（规则页边改边存，SwitchyOmega 那种）：
+ * 不弹 toast、也不拉一整轮数据 —— 引擎本来就会把规则变化推事件回来。
+ */
+export async function saveRules(opts: { silent?: boolean } = {}): Promise<boolean> {
   const rules = draftRules();
   const r = await call<void>("set_rules", { rules });
   if (!r.ok) {
-    toast(`保存失败：${r.e}`, "err", 9000);
-    return;
+    if (!opts.silent) toast(`保存失败：${r.e}`, "err", 9000);
+    return false;
   }
-  setDraft(rules, false);
+  // 请求飞在半空中时用户可能又改了：那就**别清 dirty**，否则刚敲的字会被当成"已保存"。
+  if (rulesEqual(draftRules(), rules)) setDraft(rules, false);
+  if (opts.silent) return true;
   toast("本地规则已保存（尚未发布到全网）", "ok");
   await refreshAll();
+  return true;
 }
 
 export async function sortRules(): Promise<void> {
@@ -407,6 +439,42 @@ export async function saveConfig(cfg: Config): Promise<boolean> {
   await refreshService();
   await refreshAll();
   return true;
+}
+
+/**
+ * 只改**一个**字段的配置写入（首页那几张快捷卡用）。
+ *
+ * 关键在"先 `loadConfig()` 再改"：拿一份**最新**的配置去改，而不是拿界面上那份可能
+ * 已经过期的副本整份覆盖 —— 后者会把别人（或另一个页面）刚改的东西抹掉。
+ * 服务没跑时 `set_config` 只落盘，正好也是快捷卡要的行为。
+ */
+export async function patchConfig(mutate: (cfg: Config) => void): Promise<boolean> {
+  const fresh = await loadConfig();
+  if (!fresh) return false;
+  const next = JSON.parse(JSON.stringify(fresh)) as Config;
+  mutate(next);
+  return saveConfig(next);
+}
+
+/** ① 入向端口（IT 授权给本机的那个）—— ★ 需重启才真正生效。 */
+export function setListenPorts(ports: number[]): Promise<boolean> {
+  return patchConfig((c) => {
+    c.listen.ports = ports;
+  });
+}
+
+/** ④ 本机 SOCKS5 端口。 */
+export function setSocks5Bind(addr: string): Promise<boolean> {
+  return patchConfig((c) => {
+    c.proxy.socks5_bind = addr;
+  });
+}
+
+/** 默认出口（规则与网段都没命中时的最后一顺位，§9.4.4）。传 `null` = 清除。 */
+export function setDefaultEgress(egress: string | null): Promise<boolean> {
+  return patchConfig((c) => {
+    c.route.default_egress = egress;
+  });
 }
 
 export async function configToToml(): Promise<string | null> {

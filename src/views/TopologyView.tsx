@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 
-import { pingPeer, toast } from "../state/hive";
-import { useService, useStatus, useTopology, useZones } from "../state/useHive";
+import { egressLabel } from "../lib/egress";
+import { pingPeer, setDefaultEgress, toast } from "../state/hive";
+import { useConfig, useService, useStatus, useTopology, useZones } from "../state/useHive";
 import { Empty, Panel, Pill, TableWrap } from "../components/ui";
 import { Dag } from "./Dag";
 
@@ -17,6 +18,7 @@ export function TopologyView() {
   const status = useStatus();
   const topo = useTopology();
   const zones = useZones();
+  const config = useConfig();
 
   const [showLabels, setShowLabels] = useState(true);
   const [showRelay, setShowRelay] = useState(true);
@@ -35,12 +37,30 @@ export function TopologyView() {
 
   const selfId = status?.node_id ?? svc.node_id;
   const nodes = sortNodes(topo.nodes);
+  const defaultEgress = config?.route.default_egress ?? status?.default_egress ?? null;
+  // 当前默认出口指向的节点（`direct` / `group:` 之类没有对应节点，就是 null）
+  const defaultNode = defaultEgress?.startsWith("node:")
+    ? defaultEgress.slice(5)
+    : defaultEgress === "direct"
+      ? selfId
+      : null;
+
+  async function onSetDefault(peer: string) {
+    const value = peer === selfId ? "direct" : `node:${peer}`;
+    if (await setDefaultEgress(value)) toast(`默认出口已设为 ${value}`, "ok");
+  }
 
   return (
     <>
       <Panel
         title="网络拓扑（DAG）"
-        hint="以本机为根按跳数分层。亮线＝BFS 主路径，淡线＝其余声明边。点节点可定位到下面的表格。"
+        hint={
+          <>
+            以本机为根按跳数分层。亮线＝BFS 主路径，淡线＝其余声明边。点节点可定位到下面的表格。
+            当前默认出口：<b className="mono">{egressLabel(defaultEgress, topo.nodes)}</b>
+            <span className="lv-debug">　（在下面的表格里改）</span>
+          </>
+        }
         actions={
           <>
             <label className="chk">
@@ -71,6 +91,7 @@ export function TopologyView() {
             showRelay={showRelay}
             running={svc.running}
             onSelectNode={setHighlight}
+            defaultEgressNode={defaultNode}
           />
         </div>
         <div className="legend">
@@ -151,13 +172,14 @@ export function TopologyView() {
                 <th>成本</th>
                 <th>路径</th>
                 <th>出口</th>
+                <th>默认出口</th>
                 <th>心跳</th>
               </tr>
             </thead>
             <tbody>
               {nodes.length === 0 ? (
                 <tr>
-                  <td colSpan={9}>
+                  <td colSpan={10}>
                     <Empty>
                       {svc.running
                         ? "还没有任何节点。配一条 seeds，或等同网段的 UDP 发现。"
@@ -205,6 +227,28 @@ export function TopologyView() {
                       )}
                     </td>
                     <td>{n.accepts_egress ? "是" : <Pill tone="no">否</Pill>}</td>
+                    <td>
+                      {defaultNode === n.peer ? (
+                        <>
+                          <Pill tone="cy">默认出口</Pill>
+                          <button
+                            className="mini ghost"
+                            title="清除默认出口"
+                            onClick={() => void setDefaultEgress(null)}
+                          >
+                            清除
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          className="mini ghost"
+                          title="不命中规则与网段时，从这里出去"
+                          onClick={() => void onSetDefault(n.peer)}
+                        >
+                          设为默认出口
+                        </button>
+                      )}
+                    </td>
                     <td className="lv-debug">{n.last_seen_ms} ms</td>
                   </tr>
                 ))

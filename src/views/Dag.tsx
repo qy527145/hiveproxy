@@ -101,6 +101,7 @@ export function Dag({
   showRelay,
   running,
   onSelectNode,
+  defaultEgressNode,
 }: {
   nodes: NodeView[];
   graph: GraphEdge[];
@@ -109,6 +110,8 @@ export function Dag({
   showRelay: boolean;
   running: boolean;
   onSelectNode?: (peer: NodeId) => void;
+  /** 当前默认出口所在的节点 —— 图上要能一眼认出来（UI.md §4.3）。 */
+  defaultEgressNode?: string | null;
 }) {
   const { pos, parents, width, height, empty } = useMemo(
     () => layout(nodes, graph, selfId),
@@ -178,6 +181,7 @@ export function Dag({
           stroke = "#e5657a";
           fill = "#332027";
         }
+        const isDefault = defaultEgressNode === n.peer;
         const name = n.alias || n.peer;
         const relay = n.hops ? `${n.hops} 跳` : "直连";
         const badge = isSelf
@@ -198,6 +202,7 @@ export function Dag({
                 isSelf ? "本机" : n.direct ? "直连" : n.reachable ? `经中继 · ${n.hops} 跳` : "不可达",
                 n.subnets.length > 0 ? `网段 ${n.subnets.join(" ")}` : "",
                 n.accepts_egress ? "" : "不做出口",
+                isDefault ? "★ 默认出口：不命中规则与网段时从这里出去" : "",
               ]
                 .filter(Boolean)
                 .join("\n")}
@@ -209,8 +214,9 @@ export function Dag({
               height={NODE_H}
               rx={9}
               fill={fill}
-              stroke={stroke}
-              strokeWidth={isSelf ? 2 : 1.3}
+              stroke={isDefault ? "#8be9a8" : stroke}
+              strokeWidth={isSelf ? 2 : isDefault ? 2 : 1.3}
+              strokeDasharray={isDefault ? "5 3" : undefined}
             />
             <text x={p.x + 11} y={p.y + 19} fill={text} fontSize={12.5} fontWeight={600}>
               {name.length > 16 ? `${name.slice(0, 15)}…` : name}
@@ -221,6 +227,11 @@ export function Dag({
             <text x={p.x + NODE_W - 9} y={p.y + 34} textAnchor="end" fill="#5d6577" fontSize={10}>
               {badge}
             </text>
+            {isDefault && (
+              <text x={p.x + NODE_W - 9} y={p.y + 13} textAnchor="end" fill="#8be9a8" fontSize={10}>
+                ★ 默认出口
+              </text>
+            )}
           </g>
         );
       })}

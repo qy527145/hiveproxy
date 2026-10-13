@@ -37,12 +37,44 @@ impl ResolveError {
     }
 }
 
+/// 这个出口是怎么定下来的（§9.4.4）。
+///
+/// 界面上必须能区分三者：探测结果说"内置网段兜底行"而实际走的是默认出口，
+/// 是最容易让人对着界面怀疑人生的那种错。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchSource {
+    /// 命中了合并表里的第 `idx` 条规则（本地在前、共享在后）。
+    Rule(usize),
+    /// 内置的网段兜底行（"目标落在已知网段 → 选最近的声明者"）。
+    Subnet,
+    /// `route.default_egress`（最后一顺位，§18 第 29 条）。
+    Default,
+}
+
+impl MatchSource {
+    /// 命中的规则下标；非规则命中时为 `None`。
+    pub fn rule_index(self) -> Option<usize> {
+        match self {
+            Self::Rule(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// 给界面用的短标识（`StreamProbe.via`）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule(_) => "rule",
+            Self::Subnet => "subnet",
+            Self::Default => "default",
+        }
+    }
+}
+
 /// 解析结果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub egress: Egress,
-    /// 命中的规则在合并表里的下标；`None` 表示由内置网段兜底行命中。
-    pub matched_rule: Option<usize>,
+    pub source: MatchSource,
 }
 
 impl Resolved {
@@ -66,6 +98,12 @@ pub struct ResolveCtx<'a> {
     pub groups: &'a [GroupCfg],
     /// zone 限定：非空时只在该孤岛的节点里选出口（§9.3 情形二）。
     pub island_filter: Option<&'a HashSet<NodeId>>,
+    /// 最后一顺位出口（`route.default_egress`）。
+    ///
+    /// **注意它不在 `RuleTable` 里**：放进规则表就必然排在只读的网段兜底行**之前**
+    /// —— 等于"没命中规则就一律走它"，会把内网目标的自动就近整个吃掉
+    /// （§18 第 29 条明确否掉了那个方案）。
+    pub default_egress: Option<&'a EgressTarget>,
 }
 
 /// 出口可用性判定（§9.4.4）：有路由，且对端没有声明 `accepts_egress = false`。
@@ -160,90 +198,91 @@ fn group_members(ctx: &ResolveCtx<'_>, g: &GroupRef) -> Vec<NodeId> {
     }
 }
 
-/// 解析目标 → 出口（§9.4.4）。
-pub fn resolve(ctx: &ResolveCtx<'_>, target: &Endpoint) -> Result<Resolved, ResolveError> {
-    if !ctx.rules.rules_enabled {
-        // 全局旁路：整表退化为只有网段兜底行。
-        return subnet_match(ctx, target)
-            .map(|n| Resolved { egress: egress_of(ctx, n), matched_rule: None });
-    }
+/// 解析一个出口目标 → 具体出口（§9.4.4）。
+///
+/// 返回 `Ok(None)` ＝ "这次没定下来"（候选都不可用 / `auto` 没找到网段），由**调用方**
+/// 决定是顺延下一顺位还是就此收尾 —— 规则那侧还要看 `on_unreachable`，
+/// 默认出口那侧没有下一顺位可退。
+fn resolve_egress_target(
+    ctx: &ResolveCtx<'_>,
+    target: &Endpoint,
+    egress: &EgressTarget,
+) -> Result<Option<Egress>, ResolveError> {
+    match egress {
+        EgressTarget::Block => Err(ResolveError::Refused),
 
-    for (idx, rule) in ctx.rules.merged.iter().enumerate() {
-        if !rule.enabled || !rule.matches(target) {
-            continue;
+        // "本机直接 connect" 与"愿不愿意为别人做出口"无关，永远生效。
+        EgressTarget::SelfDirect => Ok(Some(Egress::Direct)),
+
+        EgressTarget::Node(n) => {
+            Ok((can_egress(ctx, *n) && in_island(ctx, *n)).then(|| egress_of(ctx, *n)))
         }
 
-        // 命中但出口不可用时统一处理（§9.4.4 的 fallthrough）。
-        let fallthrough = |rule: &crate::rules::Rule| -> Option<Result<Resolved, ResolveError>> {
-            match rule.on_unreachable {
-                OnUnreachable::Fail => Some(Err(ResolveError::NoRoute)),
-                OnUnreachable::Fallback => None, // 顺延下一顺位
-            }
-        };
+        EgressTarget::Alias(a) => Ok(ctx
+            .alias_table
+            .get(a)
+            .filter(|n| can_egress(ctx, **n) && in_island(ctx, **n))
+            .map(|n| egress_of(ctx, *n))),
 
-        match &rule.egress {
-            EgressTarget::Block => return Err(ResolveError::Refused),
+        EgressTarget::Group(g) => {
+            let members = group_members(ctx, g);
+            let viable: Vec<NodeId> = members
+                .iter()
+                .copied()
+                .filter(|n| can_egress(ctx, *n) && in_island(ctx, *n))
+                .collect();
+            Ok(min_by_cost(ctx, &viable).map(|n| egress_of(ctx, n)))
+        }
 
-            // "本机直接 connect" 与"愿不愿意为别人做出口"无关，永远生效。
-            EgressTarget::SelfDirect => {
-                return Ok(Resolved { egress: Egress::Direct, matched_rule: Some(idx) })
-            }
+        // 显式交给网段规则；**失败也要能继续往后找**，不能直接判死。
+        EgressTarget::Auto => Ok(subnet_match(ctx, target).ok().map(|n| egress_of(ctx, n))),
+    }
+}
 
-            EgressTarget::Node(n) => {
-                if can_egress(ctx, *n) && in_island(ctx, *n) {
-                    return Ok(Resolved { egress: egress_of(ctx, *n), matched_rule: Some(idx) });
-                }
-                if let Some(e) = fallthrough(rule) {
-                    return e;
-                }
+/// 解析目标 → 出口（§9.4.4）。顺序：**规则表 → 内置网段匹配 → 默认出口**。
+pub fn resolve(ctx: &ResolveCtx<'_>, target: &Endpoint) -> Result<Resolved, ResolveError> {
+    // 全局旁路：整表退化为只有网段兜底行。**默认出口仍然生效** —— 它是配置而不是规则，
+    // 而旁路这个紧急开关要解决的是"某条规则写错了"，不是"我想要的默认出口也要停"。
+    if ctx.rules.rules_enabled {
+        for (idx, rule) in ctx.rules.merged.iter().enumerate() {
+            if !rule.enabled || !rule.matches(target) {
                 continue;
             }
-
-            EgressTarget::Alias(a) => {
-                match ctx.alias_table.get(a) {
-                    Some(n) if can_egress(ctx, *n) && in_island(ctx, *n) => {
-                        return Ok(Resolved { egress: egress_of(ctx, *n), matched_rule: Some(idx) })
-                    }
-                    _ => {
-                        if let Some(e) = fallthrough(rule) {
-                            return e;
-                        }
+            match resolve_egress_target(ctx, target, &rule.egress)? {
+                Some(egress) => return Ok(Resolved { egress, source: MatchSource::Rule(idx) }),
+                None => {
+                    // ★ `auto` 没找到网段时**一律顺延**，不看 on_unreachable：
+                    // 它表达的是"这类目标我不管，谁近谁去"，没找到就是没找到（§9.4.4）。
+                    if matches!(rule.egress, EgressTarget::Auto) {
                         continue;
+                    }
+                    match rule.on_unreachable {
+                        OnUnreachable::Fail => return Err(ResolveError::NoRoute),
+                        OnUnreachable::Fallback => continue,
                     }
                 }
             }
-
-            EgressTarget::Group(g) => {
-                let members = group_members(ctx, g);
-                let viable: Vec<NodeId> = members
-                    .iter()
-                    .copied()
-                    .filter(|n| can_egress(ctx, *n) && in_island(ctx, *n))
-                    .collect();
-                match min_by_cost(ctx, &viable) {
-                    Some(n) => {
-                        return Ok(Resolved { egress: egress_of(ctx, n), matched_rule: Some(idx) })
-                    }
-                    None => {
-                        if let Some(e) = fallthrough(rule) {
-                            return e;
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // ★ 显式交给网段规则；**失败也要继续往后找**，不能直接 return。
-            EgressTarget::Auto => match subnet_match(ctx, target) {
-                Ok(n) => {
-                    return Ok(Resolved { egress: egress_of(ctx, n), matched_rule: Some(idx) })
-                }
-                Err(_) => continue,
-            },
         }
     }
 
-    subnet_match(ctx, target).map(|n| Resolved { egress: egress_of(ctx, n), matched_rule: None })
+    // 内置网段兜底行（只读）。
+    if let Ok(n) = subnet_match(ctx, target) {
+        return Ok(Resolved { egress: egress_of(ctx, n), source: MatchSource::Subnet });
+    }
+
+    // 最后一顺位：默认出口。**不可达时不再改道** —— 它后面没有下一顺位了，
+    // 静默改道只会让"为什么走了别处"变成没人答得上来的问题（§18 第 29 条）。
+    if let Some(d) = ctx.default_egress {
+        // `auto` / `block` 在配置反序列化时就被拒了；这里再兜一层，防止程序化构造绕过。
+        if d.check_default_egress().is_err() {
+            return Err(ResolveError::NoRoute);
+        }
+        if let Some(egress) = resolve_egress_target(ctx, target, d)? {
+            return Ok(Resolved { egress, source: MatchSource::Default });
+        }
+    }
+
+    Err(ResolveError::NoRoute)
 }
 
 fn egress_of(ctx: &ResolveCtx<'_>, n: NodeId) -> Egress {
@@ -275,6 +314,7 @@ mod tests {
         router: Router,
         groups: Vec<GroupCfg>,
         aliases: HashMap<String, NodeId>,
+        default_egress: Option<EgressTarget>,
     }
 
     impl Fixture {
@@ -287,6 +327,7 @@ mod tests {
                 alias_table: &self.aliases,
                 groups: &self.groups,
                 island_filter: None,
+                default_egress: self.default_egress.as_ref(),
             }
         }
     }
@@ -294,7 +335,122 @@ mod tests {
     fn fx(me: &str, edges: &[(&str, &str)], subnets: &[(&str, &str)], deny: &[&str]) -> Fixture {
         let topo = topology(me, edges, subnets, deny);
         let router = router(me, &topo);
-        Fixture { topo, router, groups: Vec::new(), aliases: HashMap::new() }
+        Fixture {
+            topo,
+            router,
+            groups: Vec::new(),
+            aliases: HashMap::new(),
+            default_egress: None,
+        }
+    }
+
+    /// 带一个默认出口的 fixture（§9.4.4 的最后一顺位）。
+    fn fx_default(
+        me: &str,
+        edges: &[(&str, &str)],
+        subnets: &[(&str, &str)],
+        default_egress: EgressTarget,
+    ) -> Fixture {
+        let topo = topology(me, edges, subnets, &[]);
+        let router = router(me, &topo);
+        Fixture {
+            topo,
+            router,
+            groups: Vec::new(),
+            aliases: HashMap::new(),
+            default_egress: Some(default_egress),
+        }
+    }
+
+    #[test]
+    fn default_egress_takes_domains_nobody_can_route() {
+        // 域名不参与网段匹配（§9.4.2），没有默认出口时只能 NoRoute —— 这正是
+        // "浏览器流量为什么全废"的根因，也是默认出口存在的理由（§18 第 29 条）。
+        let f = fx_default(
+            "10.0.0.1",
+            &[("10.0.0.1", "10.0.0.5")],
+            &[("10.0.0.5", "10.9.0.0/16")],
+            EgressTarget::Node(nid("10.0.0.5")),
+        );
+        let t = RuleTable::default();
+        let ctx = f.ctx(&t, "10.0.0.1");
+        let r = resolve(&ctx, &ep("api.corp.example.com:443")).unwrap();
+        assert_eq!(r.egress, Egress::Node(nid("10.0.0.5")));
+        assert_eq!(r.source, MatchSource::Default, "来源必须是默认出口，不能算成网段兜底");
+    }
+
+    #[test]
+    fn default_egress_never_beats_subnet_matching() {
+        // ★ 这条是整个设计的关键：默认出口排在**网段匹配之后**。
+        // 目标在已知网段里，就必须走声明了该网段的节点，而不是默认出口 ——
+        // 否则零配置合岛（§18 第 14 条）被一条配置项悄悄吃掉。
+        let f = fx_default(
+            "10.0.0.1",
+            &[("10.0.0.1", "10.0.0.5"), ("10.0.0.1", "10.4.0.9")],
+            &[("10.4.0.9", "10.4.0.0/24"), ("10.0.0.5", "10.9.0.0/16")],
+            EgressTarget::Node(nid("10.0.0.5")),
+        );
+        let t = RuleTable::default();
+        let ctx = f.ctx(&t, "10.0.0.1");
+        let r = resolve(&ctx, &ep("10.4.0.7:3389")).unwrap();
+        assert_eq!(r.egress, Egress::Node(nid("10.4.0.9")));
+        assert_eq!(r.source, MatchSource::Subnet);
+        // 网段里没人能去（换一个谁都没声明的 IP）时才轮到默认出口。
+        let r = resolve(&ctx, &ep("172.16.0.9:3389")).unwrap();
+        assert_eq!(r.source, MatchSource::Default);
+    }
+
+    #[test]
+    fn default_egress_survives_the_bypass_switch() {
+        // 全局旁路是"规则都别生效"，而默认出口是配置不是规则 —— 旁路时它照常生效，
+        // 否则排障期间连域名都解析不动，人会怀疑是网络坏了。
+        let f = fx_default(
+            "10.0.0.1",
+            &[("10.0.0.1", "10.0.0.5")],
+            &[("10.0.0.5", "10.9.0.0/16")],
+            EgressTarget::Node(nid("10.0.0.5")),
+        );
+        let t = RuleTable::build(
+            &[Rule::new(HostMatcher::Any, PortMatcher::Any, EgressTarget::Block)],
+            None,
+            false,
+        );
+        let ctx = f.ctx(&t, "10.0.0.1");
+        let r = resolve(&ctx, &ep("api.corp.example.com:443")).unwrap();
+        assert_eq!(r.source, MatchSource::Default);
+    }
+
+    #[test]
+    fn unreachable_default_egress_is_no_route_not_a_silent_detour() {
+        // 默认出口后面没有下一顺位了：不可达就报错，不偷偷改成别的出口。
+        let f = fx_default(
+            "10.0.0.1",
+            &[("10.0.0.1", "10.0.0.5")],
+            &[("10.0.0.5", "10.9.0.0/16")],
+            EgressTarget::Node(nid("10.99.99.99")),
+        );
+        let t = RuleTable::default();
+        let ctx = f.ctx(&t, "10.0.0.1");
+        assert_eq!(
+            resolve(&ctx, &ep("api.corp.example.com:443")),
+            Err(ResolveError::NoRoute)
+        );
+    }
+
+    #[test]
+    fn default_egress_direct_never_consults_the_overlay() {
+        // `default_egress = "direct"`：目标在本机够得着的地方时，这是最省事的兜底。
+        let f = fx_default(
+            "10.0.0.1",
+            &[("10.0.0.1", "10.0.0.5")],
+            &[("10.0.0.5", "10.9.0.0/16")],
+            EgressTarget::SelfDirect,
+        );
+        let t = RuleTable::default();
+        let ctx = f.ctx(&t, "10.0.0.1");
+        let r = resolve(&ctx, &ep("api.corp.example.com:443")).unwrap();
+        assert_eq!(r.egress, Egress::Direct);
+        assert_eq!(r.source, MatchSource::Default);
     }
 
     #[test]
@@ -305,7 +461,7 @@ mod tests {
         let ctx = f.ctx(&t, "10.0.0.1");
         let r = resolve(&ctx, &ep("10.4.0.7:3389")).unwrap();
         assert_eq!(r.egress, Egress::Node(nid("10.4.0.9")));
-        assert_eq!(r.matched_rule, None, "由内置网段兜底行命中");
+        assert_eq!(r.source, MatchSource::Subnet, "由内置网段兜底行命中");
     }
 
     #[test]
@@ -359,7 +515,7 @@ mod tests {
         let ctx = f.ctx(&t, "10.0.0.1");
         let r = resolve(&ctx, &ep("api.example.com:443")).unwrap();
         assert_eq!(r.egress, Egress::Node(nid("10.4.0.9")));
-        assert_eq!(r.matched_rule, Some(1), "应当命中第二条规则");
+        assert_eq!(r.source, MatchSource::Rule(1), "应当命中第二条规则");
     }
 
     #[test]
@@ -389,7 +545,7 @@ mod tests {
         let ctx = f.ctx(&t, "10.0.0.1");
         let r = resolve(&ctx, &ep("10.4.0.7:22")).unwrap();
         assert_eq!(r.egress, Egress::Node(nid("10.4.0.9")), "顺延最终落到内置网段规则");
-        assert_eq!(r.matched_rule, None);
+        assert_eq!(r.source, MatchSource::Subnet);
     }
 
     #[test]
@@ -534,7 +690,7 @@ mod tests {
         let ctx = f.ctx(&t, "10.0.0.1");
         let r = resolve(&ctx, &ep("10.9.1.1:22")).unwrap();
         assert_eq!(r.egress, Egress::Node(nid("10.1.2.6")), "先匹配者胜");
-        assert_eq!(r.matched_rule, Some(0));
+        assert_eq!(r.source, MatchSource::Rule(0));
     }
 
     #[test]
@@ -556,6 +712,7 @@ mod tests {
             alias_table: &f.aliases,
             groups: &[],
             island_filter: Some(&island),
+            default_egress: None,
         };
         let r = resolve(&ctx, &ep("10.9.1.1:22")).unwrap();
         assert_eq!(r.egress, Egress::Node(nid("10.1.2.6")));
@@ -612,7 +769,13 @@ mod tests {
             digest: Vec::new(),
         });
         let r = router("10.0.0.1", &topo);
-        let f = Fixture { topo, router: r, groups: vec![], aliases: HashMap::new() };
+        let f = Fixture {
+            topo,
+            router: r,
+            groups: vec![],
+            aliases: HashMap::new(),
+            default_egress: None,
+        };
         let t = RuleTable::default();
         let ctx = f.ctx(&t, "10.0.0.1");
         let res = resolve(&ctx, &ep("10.8.0.5:80")).unwrap();

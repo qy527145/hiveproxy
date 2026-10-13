@@ -206,7 +206,13 @@ pub enum GroupRef {
 }
 
 /// 命中后往哪走。这是规则的全部动作面。
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+///
+/// **人读形态就是这个枚举的字符串语法**（`Serialize`/`Deserialize` 手写成
+/// `parse` / `to_config_string` 的往返）。这样 `route.default_egress` 可以直接写成
+/// `default_egress = "node:10.0.0.1"`，写错了在 **TOML 解析阶段**就报错，
+/// 而不是变成一条静默失效的配置（§9.4.4、§10）。
+/// 规则里的 `egress` 走的是 `RawRule` 的字符串字段，与这里无关。
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum EgressTarget {
     /// 交给内置网段规则：命中网段的声明者中选路由成本最低者。
     Auto,
@@ -267,6 +273,37 @@ impl EgressTarget {
             Self::Group(GroupRef::Subnet(n)) => format!("group:subnet:{n}"),
             Self::Block => "block".into(),
         }
+    }
+
+    /// 能不能当**默认出口**（§9.4.4 的最后一顺位，§18 第 29 条）。
+    ///
+    /// 拒绝两个：`auto` —— 它就是内置网段匹配本身，写在默认出口的位置上是同义反复；
+    /// `block` —— 那等于"没命中规则的全部拒绝"，属于一次误操作就能全网断网的动作，
+    /// 不该藏在默认值里（想拒绝就写一条 `*:* → block` 的规则，显式且看得见）。
+    pub fn check_default_egress(&self) -> Result<(), String> {
+        match self {
+            Self::Auto => Err(
+                "默认出口不接受 `auto` —— 那正是内置的网段匹配本身（它就是默认出口的上一顺位）"
+                    .into(),
+            ),
+            Self::Block => Err(
+                "默认出口不接受 `block` —— 那等于把没命中规则的全部流量拒掉。要拒绝请写一条显式的 `*:* → block` 规则".into(),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Serialize for EgressTarget {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.to_config_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for EgressTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -388,7 +425,8 @@ pub enum PortSpec {
 }
 
 impl PortSpec {
-    fn as_str(&self) -> String {
+    /// 归一成字符串（`Int` 也按十进制输出）。
+    pub fn as_str(&self) -> String {
         match self {
             Self::Str(s) => s.clone(),
             Self::Int(p) => p.to_string(),

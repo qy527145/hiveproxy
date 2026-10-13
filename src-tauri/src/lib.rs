@@ -10,10 +10,11 @@ use hiveproxy_core::config::Config;
 use hiveproxy_core::node::HiveNode;
 use hiveproxy_core::persist;
 use hiveproxy_core::proto::NodeId;
-use hiveproxy_core::rules::Rule;
+use hiveproxy_core::rules::{RawRule, Rule};
 use hiveproxy_core::view::{
-    GroupView, NodeStatus, PublishResult, RulePreview, RuleStat, RulesView, SharedRulesStatus,
-    StatsSnapshot, StreamProbe, TopologySnapshot, ZoneView2,
+    DialResult, ExitCandidate, GroupView, NodeStatus, PublishResult, RuleIssue, RulePreview,
+    RuleStat, RulesView, SharedRulesStatus, StatsSnapshot, StreamProbe, TopologySnapshot,
+    ZoneView2,
 };
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
@@ -217,22 +218,41 @@ fn get_rules(state: State<'_, AppState>) -> Result<RulesView, String> {
     Ok(state.node()?.rules_view())
 }
 
-#[tauri::command]
-fn set_rules(state: State<'_, AppState>, rules: Vec<Rule>) -> Result<(), String> {
-    state.node()?.set_local_rules(rules)
+/// 原始行（前端草稿的形态）→ 规则表，**逐行报错**。
+///
+/// 这一层以前收的是 `Vec<Rule>`：任何一行解析失败都是整份反序列化失败，
+/// 前端拿到的只有 `invalid args \`rules\` for command \`set_rules\`: …` ——
+/// 看不出是哪一行、也看不出该怎么改（§18 第 32 条）。
+fn parse_rows(rules: Vec<RawRule>) -> Result<Vec<Rule>, String> {
+    rules
+        .into_iter()
+        .enumerate()
+        .map(|(i, raw)| Rule::try_from(raw).map_err(|e| format!("第 {} 条：{e}", i + 1)))
+        .collect()
 }
 
 #[tauri::command]
-fn preview_rules(state: State<'_, AppState>, rules: Vec<Rule>) -> Result<RulePreview, String> {
-    Ok(state.node()?.preview_rules(rules))
+fn set_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<(), String> {
+    state.node()?.set_local_rules(parse_rows(rules)?)
+}
+
+/// 逐行校验（行内红字的来源）。不收 `Vec<Rule>` 是因为那样一失败就整份没了。
+#[tauri::command]
+fn check_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<Vec<RuleIssue>, String> {
+    Ok(state.node()?.check_rules(rules))
+}
+
+#[tauri::command]
+fn preview_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<RulePreview, String> {
+    Ok(state.node()?.preview_rules(parse_rows(rules)?))
 }
 
 #[tauri::command]
 async fn publish_rules(
     state: State<'_, AppState>,
-    rules: Vec<Rule>,
+    rules: Vec<RawRule>,
 ) -> Result<PublishResult, String> {
-    state.node()?.publish_rules(rules).await
+    state.node()?.publish_rules(parse_rows(rules)?).await
 }
 
 #[tauri::command]
@@ -246,8 +266,9 @@ fn set_rules_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), St
 }
 
 #[tauri::command]
-fn sort_rules(state: State<'_, AppState>, rules: Vec<Rule>) -> Result<Vec<Rule>, String> {
-    Ok(state.node()?.sort_rules(rules))
+fn sort_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<Vec<RawRule>, String> {
+    let sorted = state.node()?.sort_rules(parse_rows(rules)?);
+    Ok(sorted.into_iter().map(RawRule::from).collect())
 }
 
 #[tauri::command]
@@ -318,6 +339,22 @@ async fn close_stream(
 #[tauri::command]
 async fn probe_target(state: State<'_, AppState>, target: String) -> Result<StreamProbe, String> {
     state.node()?.probe_target(&target).await
+}
+
+/// 候选出口清单（§18 第 31 条）：纯路由计算，不建流。
+#[tauri::command]
+fn probe_exits(state: State<'_, AppState>, target: String) -> Result<Vec<ExitCandidate>, String> {
+    state.node()?.probe_exits(&target)
+}
+
+/// 实测：让某个出口真的连一次目标再关掉（会产生一次真实连接）。
+#[tauri::command]
+async fn probe_dial(
+    state: State<'_, AppState>,
+    target: String,
+    via: NodeId,
+) -> Result<DialResult, String> {
+    state.node()?.probe_dial(&target, via).await
 }
 
 #[tauri::command]
@@ -418,6 +455,9 @@ pub fn run() {
             active_streams,
             close_stream,
             probe_target,
+            probe_exits,
+            probe_dial,
+            check_rules,
             data_dir,
             validate_config,
             config_to_toml,

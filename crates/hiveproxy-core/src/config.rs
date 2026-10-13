@@ -80,6 +80,28 @@ pub struct DiscoveryCfg {
 pub struct ShareCfg {
     pub auto_share_subnets: bool,
     pub share_ports_only: Vec<u16>,
+    /// 不当成"本机网段"的地址范围（CIDR 列表）。
+    ///
+    /// 默认排除 `198.18.0.0/15`（RFC 2544 基准段）：Clash / Clash Verge / sing-box 这类
+    /// 代理工具的 **TUN 假地址池默认就落在这里**，它不是真实网络（§9.1）。
+    pub subnet_deny: Vec<String>,
+    /// 不当成"本机网段"的网卡名模式（结尾 `*` = 前缀匹配）。
+    ///
+    /// 默认排除 tun / utun / wg / docker 之类虚拟网卡。**取舍**：真实内网若走某条隧道
+    /// （macOS 上 WireGuard 也叫 `utunN`），把对应模式删掉即可 —— 这里排除的是
+    /// "网段声明"，不是"我能不能连"。
+    pub subnet_deny_ifaces: Vec<String>,
+}
+
+impl ShareCfg {
+    /// 解析后的排除段。非法项由 `validate()` 告警，这里直接跳过。
+    pub fn deny_cidrs(&self) -> Vec<ipnet::IpNet> {
+        self.subnet_deny.iter().filter_map(|s| s.trim().parse().ok()).collect()
+    }
+
+    pub fn deny_ifaces(&self) -> Vec<String> {
+        self.subnet_deny_ifaces.clone()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -103,6 +125,25 @@ pub struct RouteCfg {
     pub groups: Vec<GroupCfg>,
     pub accept_shared_rules: bool,
     pub publish_enabled: bool,
+    /// 规则与网段匹配都没命中时的**最后一顺位**出口（§9.4.4、§18 第 29 条）。
+    /// 写法与规则的 `egress` 同一套，但不接受 `auto` / `block`（见 `check_default_egress`）。
+    #[serde(default, deserialize_with = "de_default_egress", skip_serializing_if = "Option::is_none")]
+    pub default_egress: Option<crate::rules::EgressTarget>,
+}
+
+/// `default_egress` 的字段级校验：能解析还不够，还得是个合法的"默认位"取值。
+///
+/// 放在反序列化这一层（而不是 `validate()` 的告警表里）是刻意的：
+/// 写错一个默认出口会让整台机器的流量改道，属于"宁可报错也不静默"的那一类。
+fn de_default_egress<'de, D>(d: D) -> Result<Option<crate::rules::EgressTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<crate::rules::EgressTarget>::deserialize(d)?;
+    if let Some(e) = &v {
+        e.check_default_egress().map_err(serde::de::Error::custom)?;
+    }
+    Ok(v)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -256,7 +297,12 @@ impl Default for DiscoveryCfg {
 
 impl Default for ShareCfg {
     fn default() -> Self {
-        Self { auto_share_subnets: true, share_ports_only: Vec::new() }
+        Self {
+            auto_share_subnets: true,
+            share_ports_only: Vec::new(),
+            subnet_deny: crate::net::DEFAULT_SUBNET_DENY.iter().map(|s| s.to_string()).collect(),
+            subnet_deny_ifaces: crate::net::DEFAULT_IFACE_DENY.iter().map(|s| s.to_string()).collect(),
+        }
     }
 }
 
@@ -279,6 +325,7 @@ impl Default for RouteCfg {
             groups: Vec::new(),
             accept_shared_rules: true,
             publish_enabled: true,
+            default_egress: None,
         }
     }
 }
@@ -368,6 +415,18 @@ impl Config {
             if g.name.is_empty() {
                 warns.push("存在未命名的 route.groups 条目".to_string());
             }
+        }
+        for s in &self.share.subnet_deny {
+            // 解析不了的排除项等于没排除 —— 必须说出来，否则用户以为配上了
+            if s.trim().parse::<ipnet::IpNet>().is_err() {
+                warns.push(format!("share.subnet_deny 里的 `{s}` 不是合法 CIDR，已忽略"));
+            }
+        }
+        if self.share.subnet_deny_ifaces.iter().all(|p| p.trim().is_empty()) {
+            warns.push(
+                "share.subnet_deny_ifaces 为空：虚拟网卡（tun/utun 等）的地址也会被当成真实网段（§9.1）"
+                    .to_string(),
+            );
         }
         warns
     }
@@ -478,6 +537,10 @@ mod tests {
         assert_eq!(c.proxy.socks5_bind.to_string(), "127.0.0.1:1080");
         assert!(!c.proxy.allow_remote_socks);
         assert_eq!(c.discovery.max_dial_candidates, 64);
+        // 虚拟网卡与代理工具的假地址池默认排除（§9.1、2026-10-13）
+        assert_eq!(c.share.subnet_deny, vec!["198.18.0.0/15"]);
+        assert!(c.share.subnet_deny_ifaces.iter().any(|p| p == "utun*"));
+        assert!(!c.share.deny_cidrs().is_empty(), "默认排除段应当能解析出来");
     }
 
     #[test]
@@ -504,6 +567,38 @@ mod tests {
         assert_eq!(expand_seed("10.1.2.3:5678-5680", &probe).unwrap().1, vec![5678, 5679, 5680]);
         assert!(expand_seed("10.1.2.3:5680-5678", &probe).is_err());
         assert!(expand_seed("not-an-ip", &probe).is_err());
+    }
+
+    #[test]
+    fn default_egress_round_trips_as_a_string() {
+        // 默认出口的人读形态就是它自己的字符串语法（§9.4.4、§10）。
+        let c = Config::from_toml("[route]\ndefault_egress = \"node:10.0.0.1\"\n").unwrap();
+        assert_eq!(
+            c.route.default_egress,
+            Some(EgressTarget::Node("10.0.0.1".parse().unwrap()))
+        );
+        let toml = c.to_toml();
+        assert!(toml.contains("default_egress = \"node:10.0.0.1\""), "{toml}");
+        let back = Config::from_toml(&toml).unwrap();
+        assert_eq!(back.route.default_egress, c.route.default_egress);
+
+        // 不写 = None，且序列化时不落一个空行（skip_serializing_if）
+        let c2 = Config::default();
+        assert!(c2.route.default_egress.is_none());
+        assert!(!c2.to_toml().contains("default_egress"));
+    }
+
+    #[test]
+    fn default_egress_rejects_auto_and_block_at_parse_time() {
+        // 这两个值不是"写错了"，而是"在这里没有意义"：auto 就是网段匹配本身，
+        // block 等于一键拒绝全部流量。宁可 TOML 解析阶段报错，也不静默忽略（§18 第 29 条）。
+        for bad in ["auto", "block"] {
+            let src = format!("[route]\ndefault_egress = \"{bad}\"\n");
+            let err = Config::from_toml(&src).expect_err("应当报错");
+            assert!(err.to_string().contains("默认出口"), "{err}");
+        }
+        // 拼错的写法同样报错（走的是 EgressTarget::parse）
+        assert!(Config::from_toml("[route]\ndefault_egress = \"nod:1.2.3.4\"\n").is_err());
     }
 
     #[test]

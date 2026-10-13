@@ -10,6 +10,9 @@
 //! hiveproxy-cli run --status-interval 30 运行并周期打印状态
 //! hiveproxy-cli status | nodes | rules | streams | zones
 //! hiveproxy-cli probe 10.4.0.9:3389
+//! hiveproxy-cli probe-exits 10.4.0.9:3389 候选出口清单
+//! hiveproxy-cli dial 10.4.0.9:3389 via 10.4.0.7   实测（真的连一次）
+//! hiveproxy-cli default-egress 10.0.0.5   设默认出口（none = 清除）
 //! hiveproxy-cli reload                   重新读取配置并热更新
 //! hiveproxy-cli publish | revoke
 //! hiveproxy-cli bypass true|false        全局旁路开关
@@ -180,6 +183,10 @@ fn print_help() {
   streams                    活跃流
   zones                      网段真冲突与区域号
   probe <ip:port>            这个目标会走哪个出口
+  probe-exits <ip:port>      候选出口清单（成本 / 跳数 / 是否声明该网段）
+  dial <ip:port> via <节点>   实测：让该出口真的连一次目标（会产生真实连接）
+  default-egress [<出口>|none] 读 / 写默认出口（不命中规则与网段时的最后一顺位）
+  check-rules                （从 stdin 读一个规则 JSON 数组）逐行校验，回出错的行
   reload                     重新读取配置文件并热更新
   publish                    把当前本地规则整份发布到全网
   revoke                     撤回共享规则集
@@ -406,6 +413,34 @@ fn to_admin_line(o: &Opts) -> Result<String, String> {
             let t = arg0.ok_or("用法：hiveproxy-cli probe <ip:port>")?;
             format!("probe {t}")
         }
+        "probe-exits" => {
+            let t = arg0.ok_or("用法：hiveproxy-cli probe-exits <ip:port>")?;
+            format!("probe-exits {t}")
+        }
+        // 实测：会在网络上产生一次真实连接（§18 第 31 条）
+        "dial" => {
+            let t = arg0.ok_or("用法：hiveproxy-cli dial <ip:port> via <节点地址>")?;
+            let via = o.args.get(2).ok_or("用法：hiveproxy-cli dial <ip:port> via <节点地址>")?;
+            if o.args.get(1).map(|s| s.as_str()) != Some("via") {
+                return Err("用法：hiveproxy-cli dial <ip:port> via <节点地址>".into());
+            }
+            format!("dial {t} via {via}")
+        }
+        "default-egress" => match arg0 {
+            Some(v) => format!("default-egress {v}"),
+            None => "default-egress".into(),
+        },
+        // 逐行校验：从 stdin 读一个规则 JSON 数组（与 set_rules 同形态）
+        "check-rules" => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("读 stdin 失败：{e}"))?;
+            let rules: serde_json::Value = serde_json::from_str(&buf)
+                .map_err(|e| format!("stdin 不是合法 JSON（要一个规则数组）：{e}"))?;
+            format!("{{\"cmd\":\"check_rules\",\"rules\":{rules}}}")
+        }
         "bypass" => {
             let v = arg0.ok_or("用法：hiveproxy-cli bypass <true|false>")?;
             format!("rules-enabled {v}")
@@ -627,6 +662,24 @@ mod tests {
         assert_eq!(
             to_admin_line(&opts("seed-add", &["10.1.2.3:20000"])).unwrap(),
             "seed-add 10.1.2.3:20000"
+        );
+        // 候选出口 / 实测 / 默认出口（§18 第 29、31 条）
+        assert_eq!(
+            to_admin_line(&opts("probe-exits", &["10.4.0.9:3389"])).unwrap(),
+            "probe-exits 10.4.0.9:3389"
+        );
+        assert_eq!(
+            to_admin_line(&opts("dial", &["10.4.0.9:3389", "via", "10.4.0.7"])).unwrap(),
+            "dial 10.4.0.9:3389 via 10.4.0.7"
+        );
+        // 少写 `via` 时必须报用法错：`dial <目标> <节点>` 会被当成"目标带了个奇怪的后缀"
+        assert!(to_admin_line(&opts("dial", &["10.4.0.9:3389", "10.4.0.7"])).is_err());
+        assert!(to_admin_line(&opts("dial", &["10.4.0.9:3389", "via"])).is_err());
+        // 不带参数 = 只读；带 none = 清除
+        assert_eq!(to_admin_line(&opts("default-egress", &[])).unwrap(), "default-egress");
+        assert_eq!(
+            to_admin_line(&opts("default-egress", &["none"])).unwrap(),
+            "default-egress none"
         );
         // 参数缺失必须报用法错，而不是发一条空请求
         assert!(to_admin_line(&opts("probe", &[])).is_err());
