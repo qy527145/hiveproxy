@@ -412,6 +412,7 @@ pub fn spawn_admin(
             std::path::PathBuf::from(&cfg.admin.socket)
         };
         let desc = format!("unix {}", path.display());
+        let desc_log = desc.clone();
         tokio::spawn(async move {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -423,12 +424,12 @@ pub fn spawn_admin(
             match tokio::net::UnixListener::bind(&path) {
                 Ok(l) => {
                     node.state
-                        .log("info", "admin", format!("管理接口已就绪：{desc}"));
+                        .log("info", "admin", format!("管理接口已就绪：{desc_log}"));
                     unix_accept_loop(node, l, cancel).await;
                 }
                 Err(e) => node
                     .state
-                    .log("error", "admin", format!("{desc} 绑定失败：{e}")),
+                    .log("error", "admin", format!("{desc_log} 绑定失败：{e}")),
             }
         });
         return Some(desc);
