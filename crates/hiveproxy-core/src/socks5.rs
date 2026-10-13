@@ -1,22 +1,21 @@
-//! L5 本地出口：SOCKS5 `CONNECT`（DESIGN.md §6.4）。
+//! L5 本地出口的 SOCKS5 一侧：`CONNECT`（DESIGN.md §6.4）。
 //!
 //! 只实现 `CONNECT`（TCP）。`BIND` / `UDP ASSOCIATE` 不在 v1 范围（§17 非目标）。
+//!
+//! 端口是**两种协议共用**的（分流见 `proxy`），所以本模块只管 SOCKS5 的 framing 与
+//! 错误码映射：选路走 `proxy::route`，开流走 `proxy::open_upstream`，字节泵走
+//! `proxy::Upstream::relay` —— 与 HTTP 代理同一份实现。
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_util::sync::CancellationToken;
+use tokio::net::TcpStream;
 
-use crate::events::HiveEvent;
+use crate::proxy::{self, ConnectError, RouteError, UpstreamError};
 use crate::proto::{Endpoint, Host};
-use crate::resolver::{self, Egress, ResolveCtx, ResolveError, Resolved};
 use crate::state::HiveState;
-use crate::stream::{self, OpenError};
-use crate::zone::{self, ZoneResolution};
+use crate::stream::OpenError;
 
 // SOCKS5 常量
 const VER: u8 = 0x05;
@@ -34,58 +33,6 @@ const REP_HOST_UNREACH: u8 = 0x04;
 const REP_REFUSED: u8 = 0x05;
 const REP_CMD_UNSUPPORTED: u8 = 0x07;
 
-/// 启动 SOCKS5 服务。
-pub fn spawn_socks5(state: Arc<HiveState>, cancel: CancellationToken) {
-    let bind = state.cfg().proxy.socks5_bind;
-    let allow_remote = state.cfg().proxy.allow_remote_socks;
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                state.log("error", "socks5", format!("{bind} 绑定失败：{e} —— 本地应用将无法使用代理"));
-                return;
-            }
-        };
-        let actual = listener.local_addr().unwrap_or(bind);
-        *state.socks5_bound.write() = Some(actual);
-        state.log("info", "socks5", format!("SOCKS5 出口已就绪：{actual}"));
-        if allow_remote && !bind.ip().is_loopback() {
-            state.log("warn", "socks5", format!(
-                "SOCKS5 监听在非回环地址 {bind} 且 allow_remote_socks = true —— \
-                 同网段任何人都能借用你的网络位置（§11）"
-            ));
-        }
-
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = state.shutdown.cancelled() => break,
-                accepted = listener.accept() => {
-                    let (stream, peer) = match accepted {
-                        Ok(v) => v,
-                        Err(e) => {
-                            state.log("warn", "socks5", format!("accept 失败：{e}"));
-                            continue;
-                        }
-                    };
-                    if !allow_remote && !peer.ip().is_loopback() {
-                        state.log("warn", "socks5", format!(
-                            "拒绝 {peer}：allow_remote_socks = false 时本地出口只服务回环地址"
-                        ));
-                        continue;
-                    }
-                    let st = state.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_client(st.clone(), stream).await {
-                            st.log("debug", "socks5", format!("连接结束：{e}"));
-                        }
-                    });
-                }
-            }
-        }
-    });
-}
-
 #[derive(Debug)]
 pub enum SocksError {
     Io(std::io::Error),
@@ -98,9 +45,9 @@ pub enum SocksError {
     /// 目标地址族不认识。
     BadAddressType(u8),
     /// 解析/选路失败。
-    Resolve(ResolveError),
+    Resolve(RouteError),
     /// 打开流失败。
-    Open(OpenError),
+    Open(UpstreamError),
 }
 
 impl std::fmt::Display for SocksError {
@@ -123,7 +70,7 @@ impl From<std::io::Error> for SocksError {
     }
 }
 
-/// 处理一个 SOCKS5 客户端连接。
+/// 处理一个 SOCKS5 客户端连接（由 `proxy::spawn_proxy` 按首字节分流进来）。
 pub async fn handle_client(state: Arc<HiveState>, mut client: TcpStream) -> Result<(), SocksError> {
     client.set_nodelay(true).ok();
 
@@ -163,222 +110,62 @@ pub async fn handle_client(state: Arc<HiveState>, mut client: TcpStream) -> Resu
         }
     };
 
-    // ---- 3. 区域分流（§9.3 情形二）----
-    // 用户把 `z7+10.1.2.5` 写成目标时，SOCKS5 会以 ATYP=3（域名）送过来，
-    // 所以这里要把 zone 前缀从"域名"里摘出来。
-    let (target, mut zone) = extract_zone(target);
-    let mut island: Option<std::collections::HashSet<crate::proto::NodeId>> = None;
-
-    if zone.is_none() {
-        if let Host::Ip(ip) = &target.host {
-            let self_zone = state.self_zone();
-            let resolution = state.zones.read().resolve_ip(*ip, self_zone);
-            match resolution {
-                ZoneResolution::Ambiguous(zs) => {
-                    reply(&mut client, REP_HOST_UNREACH).await?;
-                    let _ = client.shutdown().await;
-                    let labels: Vec<String> = zs.iter().map(|z| z.label()).collect();
-                    state.log("warn", "socks5", format!(
-                        "{target} 在多个孤岛里都存在（{}）—— 请用 z<zone>+{ip}:{port} 指定你要连哪一片",
-                        labels.join(", "), port = target.port
-                    ));
-                    return Err(SocksError::Resolve(ResolveError::NoRoute));
-                }
-                // 请求方就在其中之一 → 自动收敛到自己那片，用户无感
-                ZoneResolution::PreferLocal(z) => zone = Some(z),
-                ZoneResolution::Unique(_) | ZoneResolution::Unknown => {}
-            }
-        }
-    }
-    if let Some(z) = zone {
-        island = state.island_filter(z);
-        if island.is_none() {
-            state.log("warn", "socks5", format!("指定的孤岛 {} 当前没有成员，按全局处理", z.label()));
-        }
-    }
-
-    // ---- 4. 选路 ----
-    state.log("debug", "socks5", format!("请求 {target}"));
-
-    let resolved = {
-        let cfg = state.cfg();
-        let topo = state.topology.read();
-        state.rebuild_router();
-        let router = state.router.read();
-        let rules = state.rules.read();
-        let aliases = state.aliases.read();
-        let ctx = ResolveCtx {
-            rules: &rules,
-            topo: &topo,
-            router: &router,
-            self_id: state.self_id(),
-            alias_table: &aliases,
-            groups: &cfg.route.groups,
-            default_egress: cfg.route.default_egress.as_ref(),
-            island_filter: island.as_ref(),
-        };
-        resolver::resolve(&ctx, &target)
-    };
-
-    let resolved = match resolved {
-        Ok(r) => r,
+    // ---- 3. 选路（与 HTTP 代理共用；`z<zone>+` 前缀也在那里摘，§9.3 情形二）----
+    let (target, resolved) = match proxy::route(&state, target).await {
+        Ok(v) => v,
         Err(e) => {
-            let code = match e {
-                ResolveError::Refused => REP_NOT_ALLOWED,
-                ResolveError::NoRoute => REP_HOST_UNREACH,
-            };
-            reply(&mut client, code).await?;
+            reply(&mut client, route_rep_code(&e)).await?;
             let _ = client.shutdown().await;
-            // 每台机器"没有可用网段"时的提示（§9.2 第 3 步）
-            let segs = state.topology.read().segments.len();
-            state.log("warn", "socks5", format!(
-                "{target} 无匹配失败（当前已知网段 {segs} 个）：规则未命中，且目标不落在任何节点共享的网段内"
-            ));
             return Err(SocksError::Resolve(e));
         }
     };
 
-    match resolved.egress {
-        Egress::Direct => handle_direct(state, client, target, resolved).await,
-        Egress::Node(egress) => handle_overlay(state, client, target, egress, resolved).await,
-    }
-}
-
-/// 本机直连（`egress = "direct"`，或者 subnet 匹配里 SELF 以成本 0 胜出）。
-async fn handle_direct(
-    state: Arc<HiveState>,
-    mut client: TcpStream,
-    target: Endpoint,
-    resolved: Resolved,
-) -> Result<(), SocksError> {
-    state.emit(HiveEvent::StreamOpened {
-        peer: state.self_id(),
-        stream_id: 0,
-        target: target.to_string(),
-        egress: state.self_id(),
-        direct: true,
-        matched_rule: resolved.source.rule_index(),
-    });
-
-    // 域名在**本机**解析（这不是 SOCKS5 的 `socks5h`；`socks5h` 会把域名交给出口）。
-    // ★ 解析结果可能多个（典型：`localhost` → `::1` + `127.0.0.1`），必须**逐个试**，
-    // 不能只取第一个：目标只监听 IPv4 时，取到 `::1` 就会白报一个"连接被拒"。
-    let addrs: Vec<SocketAddr> = match &target.host {
-        Host::Ip(ip) => vec![SocketAddr::new(*ip, target.port)],
-        Host::Name(n) => match tokio::net::lookup_host((n.as_str(), target.port)).await {
-            Ok(it) => it.collect(),
-            Err(_) => Vec::new(),
-        },
-    };
-    if addrs.is_empty() {
-        reply(&mut client, REP_HOST_UNREACH).await?;
-        return Err(SocksError::Resolve(ResolveError::NoRoute));
-    }
-
-    let deadline = Duration::from_secs(10);
-    let mut upstream: Option<TcpStream> = None;
-    let mut last_err: Option<std::io::Error> = None;
-    for addr in &addrs {
-        match tokio::time::timeout(deadline, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
-                upstream = Some(s);
-                break;
-            }
-            Ok(Err(e)) => last_err = Some(e),
-            Err(_) => last_err = None, // 超时
-        }
-    }
-    let Some(upstream) = upstream else {
-        let code = match &last_err {
-            Some(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => REP_REFUSED,
-            _ => REP_HOST_UNREACH,
-        };
-        reply(&mut client, code).await?;
-        return Err(SocksError::Resolve(ResolveError::NoRoute));
-    };
-    upstream.set_nodelay(true).ok();
-
-    reply(&mut client, REP_OK).await?;
-
-    let (mut cr, mut cw) = client.into_split();
-    let (mut sr, mut sw) = upstream.into_split();
-    let up = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut cr, &mut sw).await;
-        let _ = sw.shutdown().await;
-    });
-    let down = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut sr, &mut cw).await;
-        let _ = cw.shutdown().await;
-    });
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
-    }
-    Ok(())
-}
-
-/// 走 overlay：`open_stream` → 双向泵。
-async fn handle_overlay(
-    state: Arc<HiveState>,
-    mut client: TcpStream,
-    target: Endpoint,
-    egress: crate::proto::NodeId,
-    resolved: Resolved,
-) -> Result<(), SocksError> {
-    let opened = match stream::open_stream(state.clone(), target.clone(), egress, resolved.source.rule_index())
-        .await
-    {
-        Ok(o) => o,
+    // ---- 4. 开流：本机直连或 overlay（共用实现，§6.4）----
+    let upstream = match proxy::open_upstream(&state, &target, &resolved).await {
+        Ok(u) => u,
         Err(e) => {
-            let code = match &e {
-                OpenError::Refused => REP_NOT_ALLOWED,
-                OpenError::NoRoute => REP_NET_UNREACH,
-                OpenError::Timeout => REP_HOST_UNREACH,
-                OpenError::Rejected { code, .. } => match code {
-                    5 => REP_REFUSED,
-                    4 => REP_HOST_UNREACH,
-                    _ => REP_GENERAL,
-                },
-                OpenError::SelfLoop => REP_GENERAL,
-            };
-            reply(&mut client, code).await?;
+            reply(&mut client, open_rep_code(&e)).await?;
+            let _ = client.shutdown().await;
             return Err(SocksError::Open(e));
         }
     };
 
     reply(&mut client, REP_OK).await?;
-
-    let ctx = opened.ctx.clone();
-    let sink = opened.sink;
-
-    let st1 = state.clone();
-    let ctx1 = ctx.clone();
-    let (cr, cw) = client.into_split();
-    let up = tokio::spawn(async move { stream::pump_local_to_overlay(st1, ctx1, cr).await });
-    let st2 = state.clone();
-    let ctx2 = ctx.clone();
-    let down = tokio::spawn(async move {
-        stream::pump_overlay_to_local(st2, ctx2, sink, cw).await
-    });
-
-    // 任一方向结束就收尾
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
-    }
-    stream::close_stream(&state, ctx.key, crate::proto::CloseReason::Normal).await;
-    state.stats.active_streams.store(state.streams.len(), Ordering::Relaxed);
+    // SOCKS5 不会多读字节（framing 是定长的），所以前缀恒为空
+    upstream.relay(client, bytes::Bytes::new()).await;
     Ok(())
 }
 
-/// 从目标里摘出 `z<zone>+` 前缀（§9.3 情形二）。
+/// 选路失败 → SOCKS5 应答码（§9.2 的映射）。
+fn route_rep_code(e: &RouteError) -> u8 {
+    match e {
+        RouteError::Refused => REP_NOT_ALLOWED,
+        // 孤岛指不明：让调用方换个写法，对客户端来说就是"这个地址够不着"
+        RouteError::NoRoute | RouteError::Ambiguous { .. } => REP_HOST_UNREACH,
+    }
+}
+
+/// 开流失败 → SOCKS5 应答码。
 ///
-/// SOCKS5 客户端会把 `z7+10.1.2.5` 当成一个域名送过来，所以这里要重新解析一次。
-fn extract_zone(target: Endpoint) -> (Endpoint, Option<zone::ZoneId>) {
-    let Host::Name(n) = &target.host else { return (target, None) };
-    match zone::parse_zoned_target(&format!("{}:{}", n, target.port)) {
-        Ok(p) if p.zone.is_some() => (Endpoint::new(p.host, p.port), p.zone),
-        _ => (target, None),
+/// 注意 `NoRoute` 在两条路上的码**不一样**：选路阶段是 `0x04 host unreachable`，
+/// 而 overlay 建流阶段是 `0x03 network unreachable` —— 这是既有语义，别顺手统一。
+fn open_rep_code(e: &UpstreamError) -> u8 {
+    match e {
+        UpstreamError::Direct(c) => match c {
+            ConnectError::Refused(_) => REP_REFUSED,
+            ConnectError::Dns(_) | ConnectError::Timeout | ConnectError::Other(_) => REP_HOST_UNREACH,
+        },
+        UpstreamError::Overlay(o) => match o {
+            OpenError::Refused => REP_NOT_ALLOWED,
+            OpenError::NoRoute => REP_NET_UNREACH,
+            OpenError::Timeout => REP_HOST_UNREACH,
+            OpenError::Rejected { code, .. } => match code {
+                5 => REP_REFUSED,
+                4 => REP_HOST_UNREACH,
+                _ => REP_GENERAL,
+            },
+            OpenError::SelfLoop => REP_GENERAL,
+        },
     }
 }
 
@@ -433,6 +220,11 @@ pub fn parse_request(ver: u8, cmd: u8, atyp: u8) -> Result<(), SocksError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+
     use crate::testutil::{nid, state_for, topology};
 
     #[test]
@@ -564,7 +356,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_socks_client_is_dropped() {
+    async fn non_socks_bytes_are_rejected_by_the_handler() {
+        // 把非 SOCKS5 的字节直接喂给**这个处理器**时必须被拒。
+        // 端口上的协议分流在 `proxy::sniff`（那边另有测试）：正常的 HTTP 请求不会再走到这里。
         let mut cfg = crate::config::Config::default();
         cfg.node.overlay_addr = Some("10.0.0.1".parse().unwrap());
         let st = state_for("10.0.0.1", cfg);

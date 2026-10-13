@@ -197,17 +197,17 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
     title: "本地代理（★ 改动需重启服务）",
     fields: [
       {
-        path: "proxy.socks5_bind",
-        label: "socks5_bind",
+        path: "proxy.bind",
+        label: "bind",
         type: "text",
         star: true,
-        hint: "本机应用要连的 SOCKS5 地址。默认 127.0.0.1:1080（首页有快捷入口）",
+        hint: "本机应用要连的本地代理地址。同一个端口同时支持 SOCKS5 与 HTTP 代理，默认 127.0.0.1:1080（首页有快捷入口）",
       },
       {
-        path: "proxy.allow_remote_socks",
-        label: "allow_remote_socks",
+        path: "proxy.allow_remote",
+        label: "allow_remote",
         type: "bool",
-        hint: "是否允许非回环地址使用本地 SOCKS5",
+        hint: "是否允许非回环地址使用本地代理（SOCKS5 与 HTTP 会一起暴露给同网段）",
       },
     ],
   },

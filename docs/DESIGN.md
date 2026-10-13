@@ -123,7 +123,7 @@ IDEA.md 描述「A 能连 B:5678，B 连不回 A」，并期望最终「双向�
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ L5 应用/出口层   SOCKS5 服务端、目录/网段索引、本地 TCP 泵     │  可替换：换 HTTP CONNECT / TUN(未来)
+│ L5 应用/出口层   SOCKS5 + HTTP 代理（同端口）、网段索引、字节泵 │  可替换：换 TUN(未来)
 ├──────────────────────────────────────────────────────────────┤
 │ L4 会话层        Stream 生命周期、流控、半关闭、多路复用        │  稳定，改动少
 ├──────────────────────────────────────────────────────────────┤
@@ -703,12 +703,17 @@ impl Router {
 - 同时保留次优下一跳 `alt`，主路径写失败时立即切换并触发重算。**切换的前提是该流在途帧数为 0**（复用信用账本，§5.5），否则会产生分片乱序；长期繁忙的流由 `route_switch_timeout_ms`（默认 30 s）兜底强制切换并告警。
 - **图的边是双向的**：一次成功的单向拨号（A 拨 B）在「建立方向」上是有向的，但得到的会话**双向可用**（§3.1）。因此 `rebuild` 时对每条活链路添加**两条**弧，权重相同。只有链路 `health = Down` 时才移除。
 
-### 6.4 组件 D：中继与本地 SOCKS5
+### 6.4 组件 D：中继与本地代理出口（SOCKS5 + HTTP 共用一个端口）
 
-- 本地监听 `127.0.0.1:1080`（可配），实现 SOCKS5 的 `CONNECT`（无认证或用户名密码）。`BIND`/`UDP ASSOCIATE` 不在 v1 范围。
+- 本地监听 `127.0.0.1:1080`（可配），**同一个端口同时讲 SOCKS5 与 HTTP 代理**，按首字节分流（`0x05` = SOCKS5；大写方法名 + 空格 = HTTP）。无认证。SOCKS5 的 `BIND`/`UDP ASSOCIATE` 不在 v1 范围（§17）。
+- **（2026-10-13 决策）为什么要两种协议**：`curl -x 127.0.0.1:1080`（不带 scheme）与浏览器的「HTTP 代理」输入框都是 **HTTP 代理**语义 —— 客户端发的是 `GET http://主机/ HTTP/1.1`。端口上只有 SOCKS5 时这类流量会在首字节校验处被 drop（带未读数据的 close → RST），用户只看到一句"连接被重置"，而引擎里什么日志都没有。分流之后：`curl -x`、浏览器、`curl --socks5-hostname` 全部直接可用。副产品是 HTTP 一侧自带 Host，**域名规则在浏览器场景下终于能稳定命中**（浏览器会自己解析 DNS 再把 IP 交给 SOCKS5，见 §9.4.2 的 caveat）。
+- **HTTP 一侧的能力边界**：`CONNECT` 隧道（https / ssh）+ 绝对 URI 的转发（`GET http://主机/路径`，请求行改写为 origin-form，`Proxy-*` 与 `Expect` 由本地处理不外发）；**支持 keep-alive**：同一条客户端连接上的请求按"目标 authority + 出口"复用上游连接，为此解析响应分帧（`Content-Length` / `chunked` / `1xx` / `204`/`304` / `HEAD` / 读到 EOF）。请求与响应的分帧但凡矛盾（同时带 `Content-Length` 与 `Transfer-Encoding`、多个互相矛盾的 `Content-Length`）一律 **400 拒绝**，绝不"挑一个转发"（请求走私）。
+- **未知流量必须看得见**：SOCKS4 / 直接说 TLS / h2c 前言 / 纯垃圾都给一条 warn（说清"该改成什么"）后优雅关闭（先关写半边、再读掉对端已发来的字节，避免 RST）。这条是 2026-10-13 那次排障的直接教训：**拒绝走 debug 日志等于没有日志**。
+- **不做**（§17）：代理认证（不回 407，`Proxy-Authorization` 只删不认）、h2c、`Expect: 100-continue` 的转发（本地先回 `100 Continue` 再传请求体）、请求体与响应的全双工（半双工：请求体传完再读响应）。
+- 目标先经 §9.4 规则匹配 + §9.5 合流链选出出口节点，得到 `dst_node`；分配本节点内唯一的 `stream_id`，发 `StreamOpen`，等 `StreamAck`：
 - CONNECT 目标先经 §9.4 规则匹配 + §9.5 合流链选出出口节点，得到 `dst_node`；分配本节点内唯一的 `stream_id`，发 `StreamOpen`，等 `StreamAck`：
   - `ok` → 回 SOCKS5 成功应答，随后双向泵字节（本地 socket ⇄ 帧）；
-  - `err` → 回 SOCKS5 对应的错误码（`0x03` 网络不可达 / `0x05` 连接被拒）。
+  - `err` → 回协议对应的错误（SOCKS5 的 `0x03`/`0x05`；HTTP 映射成 `403`/`502`/`504` 并带一句中文说明）。
   - **`dst_node == SELF` 时短路**：直接本地 `TcpStream::connect`，不给自己发帧（§9.4.4）。
 - **流级信用**：源节点维护该流的发送信用（窗口 32 帧），**收到 `WindowUpdate` 才继续从本地 socket 读取**；出口节点把帧写进本地 socket、腾出缓冲后回收信用并回传（§5.5）。这是"慢消费者只影响自己那条流"的实现方式。
 - 出口侧（收到 `StreamOpen` 的节点）在自己本地 `TcpStream::connect(endpoint)`，成功回 `StreamAck` 并起两个泵任务；失败回错误码。
@@ -1414,8 +1419,8 @@ egress = "direct"
 # default_egress = "node:10.0.0.1"
 
 [proxy]
-socks5_bind = "127.0.0.1:1080"
-allow_remote_socks = false   # 是否允许非回环地址使用本地 SOCKS5
+bind = "127.0.0.1:1080"      # 本机应用要连的地址；**同一端口同时讲 SOCKS5 与 HTTP 代理**
+allow_remote = false         # 是否允许非回环地址使用本地代理（两种协议一起暴露）
 
 [security]
 join_token = ""              # 空 = 不鉴权；填入即启用握手 HMAC 校验
@@ -1512,7 +1517,7 @@ pub struct GroupCfg { pub name: String, pub members: Vec<String> }  // "10.1.2.3
 pub struct CostCfg { pub lan: u16, pub wan: u16, pub per_hop: u16 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProxyCfg { pub socks5_bind: SocketAddr, pub allow_remote_socks: bool }
+pub struct ProxyCfg { pub bind: SocketAddr, pub allow_remote: bool }   // 旧名 socks5_bind / allow_remote_socks 仍可读（serde alias）
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SecurityCfg {
@@ -1747,6 +1752,7 @@ v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、
 **非目标（v1 明确不做）**
 - TUN/TAP 与 L3 路由（硬约束）。
 - UDP 转发 / `UDP ASSOCIATE`（SOCKS5 的 UDP 部分）。
+- HTTP 代理一侧：不做代理认证（407 / `Proxy-Authorization`）、不做 h2c、不转发 `Expect: 100-continue`（本地代答）、不做 SOCKS4、不做请求体与响应的全双工搬运。WebSocket 之类靠 `CONNECT` 或走绝对 URI 转发 + `101` 升级（升级之后按盲管道搬字节）。
 - 跨网段穿透的反向打洞会合服务（无中心的 P2P 打洞需要至少一个可达的会合点，与"无中心服务端"有张力，留作后续可选组件）。
 - 流量计费、配额、审计。
 - 千节点级分层路由（可用 `ver_type` 版本位在未来演进）。
@@ -1827,7 +1833,7 @@ v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、
 | L4 会话 | 流上下文、流级信用（`WindowUpdate`）、双向数据泵、路径钉死与失效重置 | `session.rs`、`stream.rs` |
 | 分发 | `route_packet`：本地消费 / 内存中继 / 广播扩散 | `relay.rs` |
 | 发现 | 变化驱动 flood + 周期一跳 + 反熵摘要（`digest`/`Pull`）、LAN UDP、常驻重连与退避 | `gossip.rs`、`discovery.rs`、`dialer.rs` |
-| L5 出口 | SOCKS5 `CONNECT`、错误码映射、直连短路 | `socks5.rs` |
+| L5 出口 | 端口绑定与首字节分流（`proxy.rs`）、SOCKS5 `CONNECT` 与错误码映射（`socks5.rs`）、HTTP 代理（CONNECT / 绝对 URI / keep-alive 复用，`http_proxy.rs`）、共用选路与开流 | `proxy.rs`、`socks5.rs`、`http_proxy.rs` |
 | 持久化 | 配置、共享规则集、发布 `revision` | `persist.rs` |
 | 编排与 UI | `HiveNode` API、Tauri v2 壳（含服务启停开关）、前端（概览/拓扑 DAG/规则/配置/日志） | `node.rs`、`src-tauri/`、`src/`、`index.html`、`vite.config.ts` |
 | 无界面运行 | 本地管理接口（Unix socket / 回环 TCP，JSON 与纯文本双协议）+ `hiveproxy-cli` | `admin.rs`、`crates/hiveproxy-cli/` |
@@ -1849,6 +1855,11 @@ v2 加密阶段再加：`ed25519-dalek`、`x25519-dalek`、`chacha20poly1305`、
 | 12 | **本机可达范围与"是否广播"被绑在一起**：`auto_share_subnets = false` 的敏感机器**连自己局域网都访问不了**（`NodeIdentity::resolve` 直接把 `subnets` 清空了） | 拆成两个概念：`subnets` 始终是网卡枚举结果（"我能连什么"），新增 `share_subnets` 单独控制"是否广播"（§9.1、§19.2 的第 13 条同源） |
 | 13 | **`allow_egress = false` 把本机自己也排除了**：`can_egress(self)` 返回 `self_accepts_egress`，于是敏感机器访问自己网段返回 `NoRoute`，`egress = "direct"` 的规则也失效 | `can_egress(self)` 恒为 `true`；`ResolveCtx` **删掉** `self_accepts_egress` 字段，让这个错误在类型层面写不出来。新增端到端回归 `self_is_still_an_egress_when_it_refuses_to_serve_others`（§9.4.4） |
 | 11 | **Tauri v2 的权限系统会让前端静默白屏**：没有 `capabilities` 声明时 `event.listen` 被拒，初始化整段中断，页面只剩空白，而且原因不出现在任何日志里 | 新增 `src-tauri/capabilities/default.json`（含 `core:event:allow-listen` 等），并加了两条回归测试钉住它；同时**把前端报错回传到引擎日志**（`ui_log` 命令）。2026-10-13 前端重写为 React 后，这条链路变成三处显式出口：`window.onerror`、未处理的 Promise 拒绝、以及每个视图外面的错误边界 —— 白屏被替换成一条可读的报错 |
+
+| 14 | **关流之后两个数据泵各漏一个任务**（2026-10-13）：`sink` 的发送端挂在 `StreamCtx` 里，而泵自己也持有一份 `Arc<StreamCtx>` —— 所以 `close_stream` 之后 `sink.recv()` **永远不会**返回 `None`，停在它上面的写泵永远醒不过来；停在本地 socket 读上的那个同理（本地这端可能一直不说话） | `StreamCtx` 增加 `cancel: CancellationToken`，`close_stream` 取消它，两个泵都 `select!` 在它上面。回归测试 `closing_a_stream_wakes_both_pumps` 先证明"不修就失败"（HTTP 代理侧每条上游连接都会建一条 overlay 流，把这条泄漏放大了） |
+| 15 | **本地代理端口的拒绝不可见**（2026-10-13）：非 SOCKS5 流量（`curl -x` 的 HTTP 请求、浏览器默认代理、TLS、SOCKS4）被静默 drop，客户端只看到"连接被重置"，引擎里只有一条 debug 日志 | 端口改成 SOCKS5 + HTTP 双协议（§6.4），未知协议走 warn + 优雅关闭（先关写半边再读净对端字节，避免 RST），并在两条 warn 里带上开头几个字节 |
+
+| 16 | **源站回完就关连接时，响应尾部会丢**（2026-10-13 在真实组网里踩到）：出口侧读到 EOF 立刻关流，而尾部那几个 `Data` 帧还在路上。两个独立成因都必须修：① **关流帧走控制优先车道会插到本流尾部数据前面**（控制车道是为了心跳不被大流量饿死，但对流作用域的关流帧来说，"排在本流数据之后"才是正确语义）；② **接收侧的泵在关流时直接 `break`，把 `sink` 里已经到达、还没交给读到方的字节一起丢了**（`select!` 随机轮询，取消与数据同时就绪时可能选中取消） | ① `close_stream` 把 `StreamClose` **入本流的数据队列**（写出任务注销前会先把队列排空），队列不在 / 已满才退回控制车道；② 接收侧泵在收尾前**先把 `sink` 排空**（半关闭语义），已经从 `sink` 取到的块照发不误。端到端回归 `reply_tail_survives_a_close_right_after_the_response`（源站回完即关，跑 20 轮压竞态）**分别**钉住这两条 —— 回退任一条都会失败。用户可见症状是 `curl: (18) transfer closed with N bytes remaining to read` 或"响应传到一半就断了" |
 
 ### 19.3 有意保留的偏差
 

@@ -250,7 +250,7 @@ fn cmd_check(o: &Opts) -> u8 {
     println!("  身份：{}", cfg.node.overlay_addr.map(|a| a.to_string()).unwrap_or_else(|| "（自动取本机主网卡地址）".into()));
     println!("  监听：{} × {:?}", cfg.listen.bind, cfg.listen.ports);
     println!("  种子：{}", if cfg.peers.seeds.is_empty() { "（无 —— 同网段可靠 UDP 发现，跨网段必须至少一条）".into() } else { cfg.peers.seeds.join(", ") });
-    println!("  SOCKS5：{}", cfg.proxy.socks5_bind);
+    println!("  本地代理：{}（同一端口讲 SOCKS5 与 HTTP 代理）", cfg.proxy.bind);
     println!("  规则：{} 条本地{}", cfg.route.rules.len(), if cfg.route.rules_enabled { "" } else { "（★ 全局旁路中，全部规则会被忽略）" });
     if let Some(ep) = HiveNode::resolve_admin_endpoint(&base_dir(o), &cfg) {
         println!("  管理接口：{ep}");

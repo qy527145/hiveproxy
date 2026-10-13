@@ -88,7 +88,7 @@ export function OverviewView() {
 
   const seeds = config?.peers.seeds ?? [];
   const listenPorts = portsInput ?? (config?.listen.ports ?? []).join(", ");
-  const socksBind = socksInput ?? config?.proxy.socks5_bind ?? "";
+  const socksBind = socksInput ?? config?.proxy.bind ?? "";
   const defaultEgress = config?.route.default_egress ?? status?.default_egress ?? null;
   const ready = status !== null && stats !== null;
 
@@ -193,7 +193,7 @@ export function OverviewView() {
         <span className="sep">·</span>
         <span className="mono">{status?.node_id ?? svc.node_id}</span>
         <span className="sep">·</span>
-        <span className="mono">代理 {svc.socks5_bind}</span>
+        <span className="mono">代理 {svc.proxy_bind}</span>
         <span className="sep">·</span>
         <span>{topo.nodes.length} 个节点</span>
         <span className="sep">·</span>
@@ -425,7 +425,12 @@ export function OverviewView() {
 
         <Panel
           title="④ 代理端口"
-          hint="本机应用（浏览器、curl --socks5-hostname）连这个地址。默认 1080。"
+          hint={
+            <>
+              本机应用连这个地址，<b>同一个端口既讲 SOCKS5 也讲 HTTP 代理</b>：
+              <code>curl -x</code> / 浏览器的「HTTP 代理」和 <code>curl --socks5-hostname</code> 都能用。默认 1080。
+            </>
+          }
           actions={<Pill>★ 改完需重启</Pill>}
         >
           <Row>

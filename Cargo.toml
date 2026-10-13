@@ -30,6 +30,8 @@ if-addrs = "0.13"
 rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
+# 本地代理端口的 HTTP 侧只借它解析请求头/响应头（增量解析，零依赖）
+httparse = "1.10"
 
 [profile.release]
 lto = "thin"

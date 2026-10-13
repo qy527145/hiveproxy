@@ -1,8 +1,9 @@
 # hiveproxy
 
 去中心化的传输层覆盖网络代理。**全网运行同一个程序**，利用企业防火墙既有的单向白名单孔洞
-把分散在不同网段的机器连成一张网，在本地释放一个统一的 SOCKS5 出口 —— 之后你照常填
-真实的内网 `ip:端口`，由 hiveproxy 自己决定"这个目标该由谁去连"。
+把分散在不同网段的机器连成一张网，在本地释放一个统一的代理出口（**同一个端口同时讲
+SOCKS5 与 HTTP 代理**）—— 之后你照常填真实的内网 `ip:端口`，由 hiveproxy 自己决定
+"这个目标该由谁去连"。
 
 - 不用 TUN/TAP，不需要 Administrator / root
 - 不依赖 FRP 那类多级转发配置
@@ -61,10 +62,12 @@ echo status | nc -U /var/lib/hiveproxy/data/hiveproxy.sock
 │   │   ├── dialer.rs          常驻重连 + 指数退避 + 「不是节点」的持久标记
 │   │   ├── listener.rs        入向监听与端口对齐自检
 │   │   ├── discovery.rs       LAN UDP 自动发现
-│   │   ├── socks5.rs          L5 本地出口
+│   │   ├── proxy.rs           L5 端口绑定 + 协议分流（SOCKS5 / HTTP）+ 共用选路
+│   │   ├── socks5.rs          L5 本地出口（SOCKS5 一侧）
+│   │   ├── http_proxy.rs      L5 本地出口（HTTP 代理一侧）
 │   │   ├── node.rs            编排器（Tauri 层唯一依赖的入口）
 │   │   └── persist.rs         配置 / 共享规则集 / 发布 revision 的落盘
-│   └── tests/integration.rs   端到端组网测试（真实握手 + 真实中继 + 真实 SOCKS5）
+│   └── tests/integration.rs   端到端组网测试（真实握手 + 真实中继 + 真实 SOCKS5 / HTTP 代理）
 │   │   ├── admin.rs           本地管理接口（Unix socket / 回环 TCP）
 │   │   └── zone.rs            网段重叠消歧（§9.3 情形二）
 ├── crates/hiveproxy-cli/      无界面命令行版本（服务器 / 容器 / systemd）
@@ -119,10 +122,16 @@ cargo build -p hiveproxy-cli --release   # 编译命令行版本
 
 1. **每台机器**装程序，改 `[listen] ports` 为 **IT 授权给这台机器的入向端口**；
 2. **每个网段**挑一台"锚"，在 `[peers] seeds` 里写一条它拨得通的地址（通常指向另一个网段的锚）；
-3. 把应用或浏览器的 SOCKS5 代理指向 `127.0.0.1:1080`，然后照常访问内网地址。
+3. 把应用或浏览器的代理指向 `127.0.0.1:1080`，然后照常访问内网地址：
 
-访问域名时**务必让代理在出口解析**（curl 用 `--socks5-hostname`），因为内网普遍是
-split-horizon DNS —— 同一个域名在不同网段解析结果不同。
+```bash
+curl -x 127.0.0.1:1080 http://10.4.0.9:8080/health        # HTTP 代理（-x 的默认语义）
+curl --socks5-hostname 127.0.0.1:1080 http://10.4.0.9:8080/health   # SOCKS5
+```
+
+走 SOCKS5 且目标是域名时**务必让代理在出口解析**（curl 用 `--socks5-hostname`），
+因为内网普遍是 split-horizon DNS —— 同一个域名在不同网段解析结果不同。
+走 HTTP 代理（`-x`）则没有这个问题：主机名本来就在请求里。
 
 ## 它是怎么工作的（一句话版）
 

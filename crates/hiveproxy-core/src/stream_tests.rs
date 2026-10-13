@@ -457,3 +457,52 @@ async fn manual_control_send_is_observable() {
     let f = next_frame(&mut obs).await;
     assert_eq!(f.header.msg_type, MsgType::Ping);
 }
+
+#[tokio::test]
+async fn closing_a_stream_wakes_both_pumps() {
+    // ★ 关流之后两个泵都必须结束。`sink` 的发送端就挂在 `ctx` 里，而泵自己也持有
+    // `ctx` —— 所以没有取消的话，停在 `sink.recv()` 上的写泵**永远**醒不过来，
+    // 表现为"每关一条流漏一个任务"（2026-10-13 发现，HTTP 代理路径会放大它）。
+    let st = st("10.0.0.1");
+    let peer = nid("10.0.0.2");
+    let _obs = attach_link(&st, peer, Carrier::Direct).await;
+
+    let (sink_tx, sink_rx) = mpsc::channel(STREAM_WINDOW as usize);
+    let out = st.stream_queue(peer, 1).unwrap();
+    let ctx = Arc::new(StreamCtx::new(
+        StreamKey(peer, 1),
+        Endpoint::new(Host::Ip("10.4.0.9".parse().unwrap()), 80),
+        peer,
+        peer,
+        StreamRole::Egress,
+        None,
+        sink_tx.clone(),
+        out,
+    ));
+    ctx.set_state(StreamState::Open);
+    st.streams.insert(ctx.key, ctx.clone());
+
+    // 上行泵：本地这端一直不说话；下行泵：sink 一直没有数据
+    let (local, b) = tokio::io::duplex(1024);
+    let up = tokio::spawn(pump_local_to_overlay(st.clone(), ctx.clone(), b));
+    let down = tokio::spawn(pump_overlay_to_local(
+        st.clone(),
+        ctx.clone(),
+        sink_rx,
+        tokio::io::sink(),
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    close_stream(&st, ctx.key, CloseReason::Normal).await;
+
+    tokio::time::timeout(Duration::from_secs(1), up)
+        .await
+        .expect("关流必须叫醒上行泵")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), down)
+        .await
+        .expect("关流必须叫醒下行泵")
+        .unwrap();
+
+    drop(local);
+}

@@ -239,7 +239,7 @@ pub struct NodeStatus {
     /// 是否把上面的网段**广播**给全网（`share.auto_share_subnets`）。
     pub share_subnets: bool,
     pub accepts_egress: bool,
-    pub socks5_bind: String,
+    pub proxy_bind: String,
     pub topology_version: u64,
     pub rule_count: usize,
     pub shared_rule_count: usize,

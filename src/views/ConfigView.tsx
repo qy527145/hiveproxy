@@ -115,8 +115,8 @@ export function ConfigView() {
         title="配置"
         hint={
           <>
-            改动即时生效并落盘。标 <span className="star">★</span> 的改动（监听端口、绑定地址、SOCKS5
-            绑定）需要重启服务。
+            改动即时生效并落盘。标 <span className="star">★</span> 的改动（监听端口、绑定地址、本地代理
+            地址）需要重启服务。
           </>
         }
         actions={

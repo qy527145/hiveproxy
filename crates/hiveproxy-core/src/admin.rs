@@ -357,13 +357,13 @@ fn human_status(node: &Arc<HiveNode>) -> String {
     let st = node.status();
     let s = node.stats();
     format!(
-        "节点        {}{}\n监听        {}\n本机网段    {}\n对外声明    {}\nSOCKS5      {}\n做出口      {}\n规则        {} 条本地 + {} 条共享（{}）\n链路/流     {} / {}\n中继字节    入 {} / 出 {}\n丢帧/重置    {} / {}\n运行时长    {}s\n",
+        "节点        {}{}\n监听        {}\n本机网段    {}\n对外声明    {}\n本地代理    {}\n做出口      {}\n规则        {} 条本地 + {} 条共享（{}）\n链路/流     {} / {}\n中继字节    入 {} / 出 {}\n丢帧/重置    {} / {}\n运行时长    {}s\n",
         st.node_id,
         st.alias.map(|a| format!("（{a}）")).unwrap_or_default(),
         if st.listen.is_empty() { "（无）".into() } else { st.listen.join(", ") },
         if st.subnets.is_empty() { "（无）".into() } else { st.subnets.join(", ") },
         if st.share_subnets { "已广播（邻居可把我当出口）" } else { "不广播（只消费不贡献）" },
-        st.socks5_bind,
+        st.proxy_bind,
         if st.accepts_egress { "是" } else { "否（只自己不替他人转发）" },
         st.rule_count,
         st.shared_rule_count,
@@ -669,7 +669,7 @@ mod tests {
         cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
         cfg.listen.bind = "127.0.0.1".parse().unwrap();
         cfg.listen.ports = vec![0];
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
         cfg.admin.enabled = false; // 测试里手动跑，避免端口冲突
         let n = HiveNode::start(cfg, &dir).await.unwrap();
@@ -681,7 +681,7 @@ mod tests {
         let (n, dir) = node().await;
         let out = handle_line(&n, "status").await;
         assert!(out.contains("127.0.0.1"), "{out}");
-        assert!(out.contains("SOCKS5"));
+        assert!(out.contains("本地代理"), "状态里要能看到本地代理端口: {out}");
         n.stop().await;
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -872,7 +872,7 @@ mod tests {
         w.write_all(b"status\n").await.unwrap();
         let text = read_response(&mut lines).await;
         assert!(text[0].contains("127.0.0.1"), "{text:?}");
-        assert!(text.iter().any(|l| l.contains("SOCKS5")), "多行输出要能完整读到: {text:?}");
+        assert!(text.iter().any(|l| l.contains("本地代理")), "多行输出要能完整读到: {text:?}");
 
         w.write_all(br#"{"cmd":"status"}"#).await.unwrap();
         w.write_all(b"\n").await.unwrap();

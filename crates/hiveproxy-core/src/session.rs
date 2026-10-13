@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, Notify};
+use tokio_util::sync::CancellationToken;
 
 use crate::link::{StreamSender, STREAM_WINDOW};
 use crate::proto::{Endpoint, NodeId, StreamKey, StreamState};
@@ -67,6 +68,13 @@ pub struct StreamCtx {
     pub pending_ack: AtomicU32,
     /// 信用变化唤醒读泵。
     pub credit_notify: Notify,
+    /// 这条流被关掉时取消它 —— 两个泵都 `select!` 在它上面。
+    ///
+    /// ★ 没有它就会**漏任务**：`sink` 的发送端挂在 `StreamCtx` 里，而泵自己就持有
+    /// 一份 `Arc<StreamCtx>`，所以关流之后 `sink.recv()` 永远不会返回 `None`，
+    /// 停在 `recv` 上的写泵就永远醒不过来（每关一条流漏一个任务）。`close_stream`
+    /// 取消这个 token，泵立刻收尾。
+    pub cancel: CancellationToken,
 
     pub dropped: AtomicU64,
     /// 是否因为链路失效而被迫中断（用于告警，§17 风险 16）。
@@ -102,6 +110,7 @@ impl StreamCtx {
             allowed: AtomicU32::new(STREAM_WINDOW),
             pending_ack: AtomicU32::new(0),
             credit_notify: Notify::new(),
+            cancel: CancellationToken::new(),
             dropped: AtomicU64::new(0),
             reset_due_to_link_loss: AtomicBool::new(false),
         }

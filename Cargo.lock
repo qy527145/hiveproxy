@@ -1303,6 +1303,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "hmac",
+ "httparse",
  "if-addrs",
  "ipnet",
  "parking_lot",

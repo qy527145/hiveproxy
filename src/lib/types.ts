@@ -260,7 +260,7 @@ export interface NodeStatus {
   /** 是否把上面的网段**广播**给全网（`share.auto_share_subnets`）。 */
   share_subnets: boolean;
   accepts_egress: boolean;
-  socks5_bind: string;
+  proxy_bind: string;
   topology_version: number;
   rule_count: number;
   shared_rule_count: number;
@@ -293,7 +293,7 @@ export interface ServiceState {
   running: boolean;
   autostart: boolean;
   node_id: string;
-  socks5_bind: string;
+  proxy_bind: string;
   /** 管理接口端点（Unix socket 或回环 TCP），供 `hiveproxy-cli` 用（§20）。 */
   admin_endpoint: string | null;
   data_dir: string;
@@ -388,8 +388,8 @@ export interface RouteCfg {
 }
 
 export interface ProxyCfg {
-  socks5_bind: string;
-  allow_remote_socks: boolean;
+  bind: string;
+  allow_remote: boolean;
 }
 
 export type E2eMode = "off" | "required";

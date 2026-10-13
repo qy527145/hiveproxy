@@ -271,7 +271,7 @@ pub async fn handle_stream_open(state: Arc<HiveState>, frame: RawFrame) {
 /// 目标 → **全部**候选地址（域名在出口侧解析，§9.4.2）。
 ///
 /// 返回 `Vec` 而不是单个地址：一个域名解析出多个地址是常态，而调用方必须逐个去试。
-async fn resolve_endpoints(ep: &Endpoint) -> Result<Vec<std::net::SocketAddr>, String> {
+pub(crate) async fn resolve_endpoints(ep: &Endpoint) -> Result<Vec<std::net::SocketAddr>, String> {
     match &ep.host {
         Host::Ip(ip) => Ok(vec![std::net::SocketAddr::new(*ip, ep.port)]),
         Host::Name(name) => {
@@ -330,7 +330,11 @@ pub async fn pump_local_to_overlay<R: AsyncRead + Unpin>(
         }
 
         let mut buf = BytesMut::with_capacity(64 * 1024);
-        let n = match r.read_buf(&mut buf).await {
+        let n = match tokio::select! {
+            r = r.read_buf(&mut buf) => r,
+            // 流被关了（对端收尾 / 链路失效）：别停在这里白等本地这端说话
+            _ = ctx.cancel.cancelled() => break,
+        } {
             Ok(0) => break, // 本地端关闭
             Ok(n) => n,
             Err(e) => {
@@ -359,34 +363,70 @@ pub async fn pump_local_to_overlay<R: AsyncRead + Unpin>(
 }
 
 /// overlay 收到字节 → 本地（§5.5 的接收侧，负责回收信用）。
+///
+/// ★ 关流时要**先把已经到达的字节送完**再收尾（半关闭语义）。直接 break 会把尾部那几个帧
+/// 连同 `sink` 一起丢掉，接收方看到的就是"响应传到一半就断了"。帧是顺序分发的
+/// （`handshake.rs` 的链路读任务逐帧 `route_packet`），所以关流帧到达时它前面所有数据帧
+/// 都已经在 `sink` 里了 —— 排空就等于"把尾巴送完"。
 pub async fn pump_overlay_to_local<W: AsyncWrite + Unpin>(
     state: Arc<HiveState>,
     ctx: Arc<StreamCtx>,
     mut sink: mpsc::Receiver<Bytes>,
     mut w: W,
 ) {
-    while let Some(chunk) = sink.recv().await {
-        if ctx.closed() {
-            break;
-        }
-        let len = chunk.len();
-        if w.write_all(&chunk).await.is_err() {
-            close_stream(&state, ctx.key, CloseReason::Reset).await;
-            break;
-        }
-        ctx.bytes_to_local.fetch_add(len as u64, Ordering::Relaxed);
-        state.stats.bytes_relayed_in.fetch_add(len as u64, Ordering::Relaxed);
-
-        // 回收信用，攒够一批回 WindowUpdate（§5.5）
-        if let Some(credit) = ctx.on_frame_consumed() {
-            let msg = WindowUpdateMsg { stream_id: ctx.key.1, credit };
-            if let Ok(f) = control_frame_stream(&state, MsgType::WindowUpdate, ctx.key.0, ctx.key.1, &msg)
-            {
-                let _ = state.send_control_routed(ctx.key.0, f);
+    loop {
+        // 该收尾了吗？收尾也要先把攒下的字节送出去
+        if ctx.closed() || state.shutdown.is_cancelled() {
+            while let Ok(chunk) = sink.try_recv() {
+                if !deliver_chunk(&state, &ctx, &chunk, &mut w).await {
+                    break;
+                }
             }
+            break;
+        }
+
+        let chunk = tokio::select! {
+            c = sink.recv() => match c {
+                Some(c) => c,
+                None => break,
+            },
+            // ★ `sink` 的发送端挂在 `ctx` 里，而本任务也持有 `ctx` —— 关流之后
+            // `recv()` 不会再返回 `None`，只能靠这个取消醒过来（否则每关一条流漏一个任务）。
+            // 注意这里只 `continue` 不 `break`：`select!` 是随机轮询的，如果取消与已到达的
+            // 数据同时就绪，选了取消那一支就去排空，绝不把字节丢掉。
+            _ = ctx.cancel.cancelled() => continue,
+            _ = state.shutdown.cancelled() => continue,
+        };
+        // 取到的这块照发不误（哪怕流刚被关掉：它是关流之前就到的）
+        if !deliver_chunk(&state, &ctx, &chunk, &mut w).await {
+            break;
         }
     }
     let _ = w.shutdown().await;
+}
+
+/// 把一块 overlay 数据写进本地 socket，并回收信用（§5.5）。返回 `false` = 本地写失败。
+async fn deliver_chunk<W: AsyncWrite + Unpin>(
+    state: &Arc<HiveState>,
+    ctx: &Arc<StreamCtx>,
+    chunk: &Bytes,
+    w: &mut W,
+) -> bool {
+    if w.write_all(chunk).await.is_err() {
+        close_stream(state, ctx.key, CloseReason::Reset).await;
+        return false;
+    }
+    ctx.bytes_to_local.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    state.stats.bytes_relayed_in.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+
+    // 回收信用，攒够一批回 WindowUpdate（§5.5）
+    if let Some(credit) = ctx.on_frame_consumed() {
+        let msg = WindowUpdateMsg { stream_id: ctx.key.1, credit };
+        if let Ok(f) = control_frame_stream(state, MsgType::WindowUpdate, ctx.key.0, ctx.key.1, &msg) {
+            let _ = state.send_control_routed(ctx.key.0, f);
+        }
+    }
+    true
 }
 
 /// 收到属于本机某条流的数据帧。
@@ -438,8 +478,34 @@ pub async fn close_stream(state: &Arc<HiveState>, key: StreamKey, reason: CloseR
     let Some((_, ctx)) = state.streams.remove(&key) else { return };
     state.stats.active_streams.store(state.streams.len(), Ordering::Relaxed);
     ctx.set_state(StreamState::Closed);
-    state.drop_stream_queue(ctx.hop, key.1);
     ctx.credit_notify.notify_waiters();
+    // 叫醒两个泵：停在 `sink.recv()` 上的那个只能靠取消才醒得过来（见 `StreamCtx::cancel`）
+    ctx.cancel.cancel();
+
+    // 通知对端收尾（除非是对方发起的关闭）。
+    //
+    // ★ 关流帧必须**排在本流已经入队的数据之后**。控制优先车道会插到数据前面（§5.5 是为了
+    // 让心跳不被大流量饿死），但关流帧插到本流尾部数据前面就是**丢数据**：接收侧一看到关流
+    // 就把流摘掉，尾巴那几个 Data 帧到达时已经没有流可投 —— 表现为"响应传到一半就断"。
+    // 典型触发：源站回完响应就关连接（HTTP/1.0、`Connection: close`），出口侧的读泵立刻
+    // 结束并关流，而尾部帧还排在队列里。有本流的数据队列就入队（写出任务注销前会先把队列
+    // 排空，见 `link::drain_then_unregister`），队列不在或已满才退回控制车道。
+    if !matches!(reason, CloseReason::UnknownStream) {
+        let msg = StreamCloseMsg { stream_id: key.1, reason };
+        if let Ok(f) = control_frame_stream(state, MsgType::StreamClose, key.0, key.1, &msg) {
+            let queued = state
+                .stream_queues
+                .get(&(ctx.hop, key.1))
+                .map(|q| q.value().clone())
+                .map(|q| q.try_send(f.clone()).is_ok())
+                .unwrap_or(false);
+            if !queued {
+                let _ = state.send_control_routed(key.0, f);
+            }
+        }
+    }
+
+    state.drop_stream_queue(ctx.hop, key.1);
 
     state.emit(crate::events::HiveEvent::StreamClosed {
         peer: key.0,
@@ -448,14 +514,6 @@ pub async fn close_stream(state: &Arc<HiveState>, key: StreamKey, reason: CloseR
         bytes_out: ctx.bytes_to_local.load(Ordering::Relaxed),
         reason: format!("{reason:?}"),
     });
-
-    // 通知对端收尾（除非是对方发起的关闭）
-    if !matches!(reason, CloseReason::UnknownStream) {
-        let msg = StreamCloseMsg { stream_id: key.1, reason };
-        if let Ok(f) = control_frame_stream(state, MsgType::StreamClose, key.0, key.1, &msg) {
-            let _ = state.send_control_routed(key.0, f);
-        }
-    }
 }
 
 /// 某条链路失效：所有**钉在该下一跳**上的流立即以 `Reset` 关闭。

@@ -48,7 +48,7 @@ const SERVICE_UNKNOWN: ServiceState = {
   running: false,
   autostart: true,
   node_id: "—",
-  socks5_bind: "—",
+  proxy_bind: "—",
   admin_endpoint: null,
   data_dir: "",
   last_error: null,
@@ -466,7 +466,7 @@ export function setListenPorts(ports: number[]): Promise<boolean> {
 /** ④ 本机 SOCKS5 端口。 */
 export function setSocks5Bind(addr: string): Promise<boolean> {
   return patchConfig((c) => {
-    c.proxy.socks5_bind = addr;
+    c.proxy.bind = addr;
   });
 }
 

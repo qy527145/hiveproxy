@@ -99,7 +99,7 @@ pub struct HiveState {
     /// 分区视图缓存（§9.3），随 `topology.version` 失效。
     pub zones: RwLock<crate::zone::ZoneTable>,
     /// SOCKS5 实际绑定的地址（配 `:0` 时由系统分配，UI 与测试需要知道真实端口）。
-    pub socks5_bound: RwLock<Option<std::net::SocketAddr>>,
+    pub proxy_bound: RwLock<Option<std::net::SocketAddr>>,
     /// 是否探测到身份冲突（§6.3）。
     pub identity_conflict: AtomicBool,
     /// 规则表版本，用于 `hive://rules` 去抖。
@@ -135,7 +135,7 @@ impl HiveState {
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
             zones: RwLock::new(crate::zone::ZoneTable::default()),
-            socks5_bound: RwLock::new(None),
+            proxy_bound: RwLock::new(None),
             identity_conflict: AtomicBool::new(false),
             rules_version: AtomicU64::new(1),
         });

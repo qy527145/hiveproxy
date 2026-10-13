@@ -77,7 +77,7 @@ impl HiveNode {
         crate::gossip::spawn_periodic(state.clone(), cancel.clone());
         crate::gossip::spawn_anti_entropy(state.clone(), cancel.clone());
         discovery::spawn_discovery(state.clone(), cancel.clone());
-        crate::socks5::spawn_socks5(state.clone(), cancel.clone());
+        crate::proxy::spawn_proxy(state.clone(), cancel.clone());
 
         // ---- 事件泵 ----
         tasks.push(tokio::spawn(stats_pump(state.clone(), cancel.clone())));
@@ -132,7 +132,7 @@ impl HiveNode {
             excluded_subnets: self.state.node.excluded_subnets.clone(),
             share_subnets: self.state.node.share_subnets,
             accepts_egress: cfg.egress.allow_egress,
-            socks5_bind: cfg.proxy.socks5_bind.to_string(),
+            proxy_bind: cfg.proxy.bind.to_string(),
             topology_version: self.state.topology.read().version,
             rule_count: rules.local_count,
             shared_rule_count: rules.merged.len().saturating_sub(rules.local_count),
@@ -1009,7 +1009,7 @@ mod tests {
         cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
         cfg.listen.bind = "127.0.0.1".parse().unwrap();
         cfg.listen.ports = vec![0]; // 由系统分配，避免与真实服务冲突
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
         cfg.node.alias = Some("test-node".into());
 
@@ -1032,7 +1032,7 @@ mod tests {
         cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
         cfg.listen.bind = "127.0.0.1".parse().unwrap();
         cfg.listen.ports = vec![0];
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
         cfg.peers.entry = vec![crate::config::PeerEntry {
             address: "10.4.0.9:20000".into(),
@@ -1087,7 +1087,7 @@ mod tests {
             cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
             cfg.listen.bind = "127.0.0.1".parse().unwrap();
             cfg.listen.ports = vec![0];
-            cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+            cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
             cfg.discovery.lan_udp = false;
             cfg
         };
@@ -1117,7 +1117,7 @@ mod tests {
 
         let mut cfg = Config::default();
         cfg.listen.ports = vec![0];
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
         cfg.admin.enabled = false;
         cfg.egress.allow_egress = false;      // 我不替别人转发
@@ -1151,7 +1151,7 @@ mod tests {
         cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
         cfg.listen.bind = "127.0.0.1".parse().unwrap();
         cfg.listen.ports = vec![0];
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
 
         let node = HiveNode::start(cfg, &dir).await.unwrap();
@@ -1182,7 +1182,7 @@ mod tests {
         cfg.node.overlay_addr = Some("127.0.0.1".parse().unwrap());
         cfg.listen.bind = "127.0.0.1".parse().unwrap();
         cfg.listen.ports = vec![0];
-        cfg.proxy.socks5_bind = "127.0.0.1:0".parse().unwrap();
+        cfg.proxy.bind = "127.0.0.1:0".parse().unwrap();
         cfg.discovery.lan_udp = false;
         (HiveNode::start(cfg, &dir).await.unwrap(), dir)
     }

@@ -55,7 +55,7 @@ struct ServiceState {
     running: bool,
     autostart: bool,
     node_id: String,
-    socks5_bind: String,
+    proxy_bind: String,
     admin_endpoint: Option<String>,
     data_dir: String,
     last_error: Option<String>,
@@ -70,7 +70,7 @@ fn service_state(state: State<'_, AppState>) -> ServiceState {
     let (node_id, socks5) = match &g.node {
         Some(n) => {
             let st = n.status();
-            (st.node_id.to_string(), st.socks5_bind)
+            (st.node_id.to_string(), st.proxy_bind)
         }
         None => {
             // 未运行时也要能显示"我是谁、代理挂哪儿"，所以从配置/网卡现算
@@ -80,7 +80,7 @@ fn service_state(state: State<'_, AppState>) -> ServiceState {
                 .map(|a| a.to_string())
                 .or_else(|| hiveproxy_core::net::primary_ip().map(|a| a.to_string()))
                 .unwrap_or_else(|| "—".into());
-            (id, cfg.proxy.socks5_bind.to_string())
+            (id, cfg.proxy.bind.to_string())
         }
     };
 
@@ -88,7 +88,7 @@ fn service_state(state: State<'_, AppState>) -> ServiceState {
         running: g.node.is_some(),
         autostart: cfg.service.autostart,
         node_id,
-        socks5_bind: socks5,
+        proxy_bind: socks5,
         admin_endpoint: g.node.as_ref().and_then(|n| n.admin_endpoint()),
         data_dir: persist::data_dir(&base_dir).to_string_lossy().to_string(),
         last_error: g.last_error.clone(),

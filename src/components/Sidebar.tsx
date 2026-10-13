@@ -79,7 +79,7 @@ export function Sidebar({ view, onSelect }: { view: ViewId; onSelect: (id: ViewI
           </button>
         </div>
         <KV k="本机" v={svc.node_id} />
-        <KV k="代理" v={svc.socks5_bind} />
+        <KV k="代理" v={svc.proxy_bind} />
         <KV k="默认出口" v={status?.default_egress ?? "（没设）"} />
         <div className="foot">
           {warnings.map((w) => (

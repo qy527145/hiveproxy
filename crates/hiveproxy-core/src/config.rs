@@ -162,11 +162,19 @@ pub struct GroupCfg {
     pub members: Vec<String>,
 }
 
+/// 本地代理端口（**一个端口同时讲 SOCKS5 与 HTTP 代理**，§6.4）。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProxyCfg {
-    pub socks5_bind: SocketAddr,
-    pub allow_remote_socks: bool,
+    /// 本机应用要连的本地代理地址。
+    ///
+    /// `alias` 认旧名 `socks5_bind`：端口上只有 SOCKS5 时的老配置必须继续能解析 ——
+    /// `deny_unknown_fields` 会把不认识的键直接当错误，改名不能是破坏性的。
+    #[serde(alias = "socks5_bind")]
+    pub bind: SocketAddr,
+    /// 是否允许非回环地址使用本地代理。旧名 `allow_remote_socks`（同上，走 alias）。
+    #[serde(alias = "allow_remote_socks")]
+    pub allow_remote: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -339,8 +347,8 @@ impl Default for CostCfg {
 impl Default for ProxyCfg {
     fn default() -> Self {
         Self {
-            socks5_bind: "127.0.0.1:1080".parse().expect("valid literal"),
-            allow_remote_socks: false,
+            bind: "127.0.0.1:1080".parse().expect("valid literal"),
+            allow_remote: false,
         }
     }
 }
@@ -385,10 +393,12 @@ impl Config {
         if self.discovery.max_dial_candidates == 0 {
             warns.push("discovery.max_dial_candidates = 0 会让 dialer 没有候选可拨".to_string());
         }
-        if self.proxy.allow_remote_socks && !self.proxy.socks5_bind.ip().is_loopback() {
+        if self.proxy.allow_remote && !self.proxy.bind.ip().is_loopback() {
             warns.push(format!(
-                "SOCKS5 监听在非回环地址 {} 且 allow_remote_socks = true —— 同网段任何人都能用你的网络位置（§11）",
-                self.proxy.socks5_bind
+                "本地代理监听在非回环地址 {} 且 allow_remote = true —— 同网段任何人都能用你的网络位置（§11）。\
+                 端口上同时讲 SOCKS5 与 HTTP 代理，**HTTP 正向代理比 SOCKS5 更容易被滥用**（任何 GUI 应用、\
+                 甚至一段脚本都能拿它出去），非必要不要开",
+                self.proxy.bind
             ));
         }
         if let Some(a) = self.admin.tcp {
@@ -534,8 +544,8 @@ mod tests {
         assert!(c.route.accept_shared_rules);
         assert!(c.route.publish_enabled, "发布不限制（§18 第 22 条）");
         assert!(c.egress.allow_egress);
-        assert_eq!(c.proxy.socks5_bind.to_string(), "127.0.0.1:1080");
-        assert!(!c.proxy.allow_remote_socks);
+        assert_eq!(c.proxy.bind.to_string(), "127.0.0.1:1080");
+        assert!(!c.proxy.allow_remote);
         assert_eq!(c.discovery.max_dial_candidates, 64);
         // 虚拟网卡与代理工具的假地址池默认排除（§9.1、2026-10-13）
         assert_eq!(c.share.subnet_deny, vec!["198.18.0.0/15"]);
@@ -548,6 +558,25 @@ mod tests {
         // deny_unknown_fields：拼错的键必须报错，而不是静默忽略（§10.1）。
         let err = Config::from_toml("[listen]\nprot = [5678]\n");
         assert!(err.is_err(), "拼错的键 `prot` 应当报错");
+    }
+
+    #[test]
+    fn proxy_accepts_the_old_field_names() {
+        // ★ 端口上只有 SOCKS5 时落盘的配置（`socks5_bind` / `allow_remote_socks`）必须继续能读 ——
+        // 已经有机器在跑老配置，改名不能变成"启动即解析失败"（§6.4、2026-10-13）。
+        let old = Config::from_toml(
+            "[proxy]\nsocks5_bind = \"127.0.0.1:18080\"\nallow_remote_socks = true\n",
+        )
+        .expect("旧字段名必须继续可解析");
+        assert_eq!(old.proxy.bind.to_string(), "127.0.0.1:18080");
+        assert!(old.proxy.allow_remote);
+
+        // 新名字与旧名字等价，且写回去用的是新名字
+        let new = Config::from_toml("[proxy]\nbind = \"127.0.0.1:18080\"\nallow_remote = true\n").unwrap();
+        assert_eq!(new.proxy, old.proxy);
+        let toml = new.to_toml();
+        assert!(toml.contains("bind = "), "序列化必须用新名字：\n{toml}");
+        assert!(!toml.contains("socks5_bind"), "不该再写出旧名字：\n{toml}");
     }
 
     #[test]
