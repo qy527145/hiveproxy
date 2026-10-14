@@ -187,8 +187,17 @@ async fn text_command(node: &Arc<HiveNode>, line: &str) -> String {
         "zones" => human_zones(node),
         "reload" | "config" => match std::fs::read_to_string(node.base_dir().join("hiveproxy.toml")) {
             Ok(t) => match crate::config::Config::from_toml(&t) {
-                Ok(cfg) => match node.set_config(cfg) {
-                    Ok(()) => format!("配置已重新加载：{}\n", node.base_dir().join("hiveproxy.toml").display()),
+                // ★ 走 `apply_config` 而不是 `set_config`：手工把端口改在文件里再 reload，
+                // 过去是"存下来但不生效"（只留一行 warn）。现在端口会真的重新绑定。
+                //
+                // 身份/网段表那一档在这条路上处理不了 —— 重建引擎要 `ServiceHandle`，
+                // 而管理接口只握着一个正在跑的 node。如实拒绝，不要收下一个不会生效的配置。
+                Ok(cfg) if crate::config::classify_change(&node.config(), &cfg).engine => err(
+                    "这份配置改了身份或网段表（node.* / share.subnet_deny* / admin.*），\
+                     需要重启进程才生效（文档里的第 ③ 档）",
+                ),
+                Ok(cfg) => match node.apply_config(cfg).await {
+                    Ok(_) => format!("配置已重新加载：{}\n", node.base_dir().join("hiveproxy.toml").display()),
                     Err(e) => err(e),
                 },
                 Err(e) => err(format!("配置解析失败：{e}")),

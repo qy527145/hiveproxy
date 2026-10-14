@@ -159,7 +159,7 @@ export function OverviewView() {
     }
     if (await setListenPorts(list)) {
       setPortsInput(null);
-      toast("入向端口已保存 —— 需要重启服务才真正生效", "warn", 9000);
+      toast("入向端口已保存并重新绑定 —— 在途连接不受影响", "ok", 9000);
     }
   }
 
@@ -173,7 +173,7 @@ export function OverviewView() {
     }
     if (await setSocks5Bind(v)) {
       setSocksInput(null);
-      toast("代理地址已保存 —— 需要重启服务才真正生效", "warn", 9000);
+      toast("代理地址已保存并重新绑定 —— 在途连接不受影响", "ok", 9000);
     }
   }
 
@@ -220,7 +220,7 @@ export function OverviewView() {
               必须与对端 <code>seeds</code> 里写的端口一致。
             </>
           }
-          actions={<Pill>★ 改完需重启</Pill>}
+          actions={<Pill>★ 改完自动重新绑定</Pill>}
         >
           <Row>
             <input
@@ -431,7 +431,7 @@ export function OverviewView() {
               <code>curl -x</code> / 浏览器的「HTTP 代理」和 <code>curl --socks5-hostname</code> 都能用。默认 1080。
             </>
           }
-          actions={<Pill>★ 改完需重启</Pill>}
+          actions={<Pill>★ 改完自动重新绑定</Pill>}
         >
           <Row>
             <input

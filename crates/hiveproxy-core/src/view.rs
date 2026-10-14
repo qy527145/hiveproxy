@@ -250,6 +250,21 @@ pub struct NodeStatus {
     pub version: String,
 }
 
+/// 服务状态快照（`service_state` / `service_start` / `service_stop` 三兄弟共用一个形状）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ServiceState {
+    pub running: bool,
+    /// 桌面端启动时是否自动组网（`hiveproxy-cli run` 忽略此项，它总是启动）。
+    pub autostart: bool,
+    /// 未运行时也要有值（从配置或本机主网卡现算），否则界面顶部只能显示一句"—"。
+    pub node_id: String,
+    pub proxy_bind: String,
+    pub admin_endpoint: Option<String>,
+    pub data_dir: String,
+    /// 上次启动失败的原因。★ 有这个字段，界面才不会在启动失败时静默白屏。
+    pub last_error: Option<String>,
+}
+
 /// 规则表的 IPC 形态：合并表 + 本地/共享分界 + 来源与 revision。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RulesView {

@@ -456,7 +456,12 @@ export async function patchConfig(mutate: (cfg: Config) => void): Promise<boolea
   return saveConfig(next);
 }
 
-/** ① 入向端口（IT 授权给本机的那个）—— ★ 需重启才真正生效。 */
+/**
+ * ① 入向端口（IT 授权给本机的那个）。
+ *
+ * ★ 引擎会**原地重新绑定**（不重建引擎、不断在途连接）—— 见 docs/WEBUI.md §5.2。
+ * 这里以前写的是"需重启才真正生效"，那是档位还没做出来时的说法。
+ */
 export function setListenPorts(ports: number[]): Promise<boolean> {
   return patchConfig((c) => {
     c.listen.ports = ports;

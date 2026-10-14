@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_util::sync::CancellationToken;
+use tokio::task::JoinHandle;
 
 use crate::proto::{Endpoint, Host, NodeId};
 use crate::resolver::{self, Egress, ResolveCtx, ResolveError, Resolved};
@@ -47,52 +47,59 @@ const BRIDGE_BUF: usize = 64 * 1024;
 // 端口与分流
 // ---------------------------------------------------------------------------
 
-/// 启动本地代理端口。**一个端口同时讲 SOCKS5 与 HTTP 代理**。
-pub fn spawn_proxy(state: Arc<HiveState>, cancel: CancellationToken) {
+/// 绑定本地代理端口。**一个端口同时讲 SOCKS5 与 HTTP 代理**。
+///
+/// 绑与起分开是刻意的：冷启动对绑失败是容忍的（告警、节点照起），
+/// 改端口时则是全有全无 —— 两种策略由调用方选（见 `HiveNode::spawn_bound`）。
+pub async fn bind_one(bind: std::net::SocketAddr) -> Result<TcpListener, String> {
+    TcpListener::bind(bind)
+        .await
+        .map_err(|e| format!("{bind} 绑定失败：{e} —— 本地应用将无法使用代理"))
+}
+
+/// 在**已经绑好**的监听器上开始服务，返回任务句柄（改端口时要 `abort` 它才能确定地释放端口）。
+pub fn spawn_on(state: Arc<HiveState>, listener: TcpListener) -> JoinHandle<()> {
+    tokio::spawn(async move { serve(state, listener).await })
+}
+
+async fn serve(state: Arc<HiveState>, listener: TcpListener) {
     let bind = state.cfg().proxy.bind;
     let allow_remote = state.cfg().proxy.allow_remote;
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(bind).await {
-            Ok(l) => l,
-            Err(e) => {
-                state.log("error", "proxy", format!("{bind} 绑定失败：{e} —— 本地应用将无法使用代理"));
-                return;
-            }
-        };
-        let actual = listener.local_addr().unwrap_or(bind);
-        *state.proxy_bound.write() = Some(actual);
-        state.log("info", "proxy", format!("本地代理端口已就绪：{actual}（SOCKS5 与 HTTP 代理共用）"));
-        if allow_remote && !bind.ip().is_loopback() {
-            state.log("warn", "proxy", format!(
-                "本地代理监听在非回环地址 {bind} 且 allow_remote = true —— \
-                 同网段任何人都能借用你的网络位置，HTTP 正向代理尤其容易被滥用（§11）"
-            ));
-        }
+    let actual = listener.local_addr().unwrap_or(bind);
+    *state.proxy_bound.write() = Some(actual);
+    state.log("info", "proxy", format!("本地代理端口已就绪：{actual}（SOCKS5 与 HTTP 代理共用）"));
+    if allow_remote && !bind.ip().is_loopback() {
+        state.log("warn", "proxy", format!(
+            "本地代理监听在非回环地址 {bind} 且 allow_remote = true —— \
+             同网段任何人都能借用你的网络位置，HTTP 正向代理尤其容易被滥用（§11）"
+        ));
+    }
 
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = state.shutdown.cancelled() => break,
-                accepted = listener.accept() => {
-                    let (stream, peer) = match accepted {
-                        Ok(v) => v,
-                        Err(e) => {
-                            state.log("warn", "proxy", format!("accept 失败：{e}"));
-                            continue;
-                        }
-                    };
-                    if !allow_remote && !peer.ip().is_loopback() {
-                        state.log("warn", "proxy", format!(
-                            "拒绝 {peer}：allow_remote = false 时本地代理只服务回环地址"
-                        ));
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                let (stream, peer) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        state.log("warn", "proxy", format!("accept 失败：{e}"));
                         continue;
                     }
-                    let st = state.clone();
-                    tokio::spawn(async move { handle_conn(st, stream, peer).await });
+                };
+                // ★ 每个连接现读一次配置（和 listener 的 max_links 一样），
+                // 这样 `proxy.allow_remote` 改完就是**热生效** —— 否则它会被
+                // 下面那次启动时的快照钉死，"界面显示改了、实际没改"。
+                if !state.cfg().proxy.allow_remote && !peer.ip().is_loopback() {
+                    state.log("warn", "proxy", format!(
+                        "拒绝 {peer}：allow_remote = false 时本地代理只服务回环地址"
+                    ));
+                    continue;
                 }
+                let st = state.clone();
+                tokio::spawn(async move { handle_conn(st, stream, peer).await });
             }
         }
-    });
+    }
 }
 
 /// 一个连接上认出来的协议。

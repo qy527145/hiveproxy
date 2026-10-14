@@ -469,3 +469,18 @@ export type HiveEvent =
 
 /** Tauri 侧统一用一个事件名 `hive`，载荷里用 `event` 字段区分（src-tauri/src/lib.rs）。 */
 export const HIVE_EVENT = "hive";
+
+/* ────────────────────────────── 会话（web 模式；桌面端没有这回事）────────────────────────────── */
+
+/**
+ * web 模式的登录态。桌面端不走这一套 —— status 初值直接是 `authed`（见 state/auth.ts），
+ * 于是 App 用同一段分支就能两边通吃。
+ *
+ * `unknown` 这一档是**必需的**：登录没登录要问一次服务端才知道，这段窗口里既不能先画
+ * 登录页（已登录的人会闪一下门），也不能先画主界面（未登录的人会闪一下数据）。
+ */
+export interface SessionState {
+  status: "unknown" | "anon" | "authed";
+  /** 首次登录、令牌还是启动日志里打印的那个：必须先改掉，不可跳过。 */
+  mustChange: boolean;
+}

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Sidebar } from "./components/Sidebar";
@@ -6,8 +6,10 @@ import { Toasts } from "./components/Toasts";
 import { TopBar } from "./components/TopBar";
 import { VIEWS, type ViewId } from "./components/nav";
 import { report } from "./lib/report";
+import { checkSession, useSession } from "./state/auth";
 import { boot, ruleDraftStore, serviceStore, topologyStore } from "./state/hive";
 import { ConfigView } from "./views/ConfigView";
+import { LoginView } from "./views/LoginView";
 import { LogsView } from "./views/LogsView";
 import { OverviewView } from "./views/OverviewView";
 import { RulesView } from "./views/RulesView";
@@ -36,7 +38,7 @@ function viewFromHash(): ViewId {
 
 export function App() {
   const [view, setView] = useState<ViewId>(viewFromHash);
-  const started = useRef(false);
+  const session = useSession();
 
   // 视图与 hash 同步。看着像给桌面应用加了个没用的 URL，其实解决的是一个真问题：
   // dev 下改一行前端就整页刷新（没有 Fast Refresh），没有它每次都被打回概览页，
@@ -47,15 +49,22 @@ export function App() {
     return () => window.removeEventListener("hashchange", onHashChange);
   }, []);
 
+  // web 模式：登录态要问一次服务端才知道。桌面端的初值就是 authed，这里不会被调到。
+  useEffect(() => {
+    if (session.status === "unknown") void checkSession();
+  }, [session.status]);
+
   const selectView = (next: ViewId) => {
     setView(next);
     window.location.hash = next;
   };
 
+  // "可以进主界面了" = 已登录、且不在强制改令牌流程里。桌面端恒为 true。
+  const ready = session.status === "authed" && !session.mustChange;
+
   useEffect(() => {
-    // 挂载时只启动一次：事件桥与轮询都是"全局单例"，跑两遍会重复订阅。
-    if (started.current) return;
-    started.current = true;
+    // 未登录时不连引擎：连上去只会得到一串 401，还白白把事件桥和轮询点着。
+    if (!ready) return;
 
     let stop: (() => void) | null = null;
     let cancelled = false;
@@ -92,7 +101,19 @@ export function App() {
       cancelled = true;
       stop?.();
     };
-  }, []);
+  }, [ready]);
+
+  // 会话状态未知：既不能先画登录页（已登录的人会闪一下门），也不能先画主界面
+  // （未登录的人会闪一下数据）。给一个安静的加载态，等 checkSession 回来。
+  if (session.status === "unknown") {
+    return (
+      <div style={{ flex: "1 1 auto", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div className="empty">正在连接服务…</div>
+      </div>
+    );
+  }
+
+  if (!ready) return <LoginView />;
 
   return (
     <>

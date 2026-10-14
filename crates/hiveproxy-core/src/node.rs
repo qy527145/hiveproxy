@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Config;
+use crate::config::{Config, ConfigChange};
 use crate::discovery;
 use crate::error::ConfigError;
 use crate::events::now_unix;
@@ -35,6 +35,21 @@ pub struct HiveNode {
     pub state: Arc<HiveState>,
     pub base_dir: PathBuf,
     cancel: CancellationToken,
+    /// **只管绑定类子系统**（listener + proxy）的任务句柄。
+    ///
+    /// 单独记着它们是改端口能做到"不重建引擎"的全部原因：`abort` 掉这几个任务
+    /// 只会让 listener / proxy 的 accept loop 停下，拨号器、gossip、事件泵、**在途连接**
+    /// 全都不受影响（已接受的连接是各自 detached 的任务，见 `listener::accept_loop` /
+    /// `proxy::serve`）。
+    ///
+    /// ★ 必须是句柄而不是取消令牌：**取消是异步的**，取消之后旧任务要等到被调度才释放
+    /// 那个 `TcpListener`。改端口时不等它死透就去绑，重叠的端口必然 `EADDRINUSE`
+    /// （这个 bug 是 `tests/rebind.rs` 抓出来的）。`abort()` + `await` 才是确定的。
+    ///
+    /// ★ 两侧**分开记**：只改入向端口时压根不碰代理。合成一坨的话，代理端口被
+    /// 别人占着（很常见）就会让"改个入向端口"整体失败，甚至回滚都拿不回来。
+    listen_tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    proxy_task: parking_lot::Mutex<Option<JoinHandle<()>>>,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     /// 管理接口实际监听的位置（`None` = 未启用）。CLI 用它来告诉用户往哪儿连。
     admin_endpoint: parking_lot::Mutex<Option<String>>,
@@ -72,12 +87,10 @@ impl HiveNode {
         let mut tasks = Vec::new();
 
         // ---- 子系统 ----
-        crate::listener::spawn_listeners(state.clone(), cancel.clone());
         crate::dialer::spawn_dialer(state.clone(), cancel.clone());
         crate::gossip::spawn_periodic(state.clone(), cancel.clone());
         crate::gossip::spawn_anti_entropy(state.clone(), cancel.clone());
         discovery::spawn_discovery(state.clone(), cancel.clone());
-        crate::proxy::spawn_proxy(state.clone(), cancel.clone());
 
         // ---- 事件泵 ----
         tasks.push(tokio::spawn(stats_pump(state.clone(), cancel.clone())));
@@ -90,9 +103,23 @@ impl HiveNode {
             state: state.clone(),
             base_dir,
             cancel,
+            listen_tasks: parking_lot::Mutex::new(Vec::new()),
+            proxy_task: parking_lot::Mutex::new(None),
             tasks: parking_lot::Mutex::new(tasks),
             admin_endpoint: parking_lot::Mutex::new(None),
         });
+
+        // 入向端口与本地代理在 `Arc<Self>` 建好之后才绑：这样
+        // ① 绑失败能经 `self.state.log` 进日志与界面；② 和改端口走**同一段代码**。
+        // 冷启动是**容忍**单个端口失败的（§6.2.3）—— 端口被占也得能把节点起起来，
+        // 否则用户没有界面可改（docs/WEBUI.md §2.1）。
+        let start_cfg = node.state.cfg();
+        if let Err(e) = node.spawn_listen(&start_cfg, false).await {
+            node.state.log("error", "listener", e);
+        }
+        if let Err(e) = node.spawn_proxy(&start_cfg, false).await {
+            node.state.log("error", "proxy", e);
+        }
 
         // 本地管理接口（§20）：无界面服务器靠它查询与下发规则。
         // 必须在 `Arc<Self>` 构造出来之后才能启动。
@@ -127,7 +154,7 @@ impl HiveNode {
         NodeStatus {
             node_id: self.state.self_id(),
             alias: self.state.node.alias.clone(),
-            listen: self.state.node.listen.iter().map(|a| a.to_string()).collect(),
+            listen: self.state.listen_addrs().iter().map(|a| a.to_string()).collect(),
             subnets: self.state.node.subnets.iter().map(|n| n.to_string()).collect(),
             excluded_subnets: self.state.node.excluded_subnets.clone(),
             share_subnets: self.state.node.share_subnets,
@@ -223,14 +250,14 @@ impl HiveNode {
     // 配置与规则
     // ------------------------------------------------------------------
 
-    /// 热更新配置。
+    /// 热更新配置（**不处理绑定类字段**）。
+    ///
+    /// 调用方必须先用 `config::classify_change` 判过：`listen` / `proxy` 档要走
+    /// [`Self::apply_config`]，`engine` 档要走 `ServiceHandle::restart`。
+    /// 这里对绑定类字段是"存下来但不生效"，所以直接调它会让界面显示的和实际听的对不上。
     pub fn set_config(&self, cfg: Config) -> Result<(), String> {
         let warns = cfg.validate();
         let old = self.state.cfg();
-        let listen_changed = old.listen.ports != cfg.listen.ports
-            || old.listen.bind != cfg.listen.bind
-            || old.listen.max_links != cfg.listen.max_links;
-        let proxy_changed = old.proxy != cfg.proxy;
         let discovery_changed = old.discovery != cfg.discovery;
         let peers_changed = old.peers != cfg.peers;
 
@@ -239,23 +266,168 @@ impl HiveNode {
 
         self.state.rebuild_rules();
         self.state.emit_rules();
+        // ★ 有些字段（`share.share_ports_only` / `listen.advertise` / `egress.allow_egress`）
+        // 是经 `sync_self_state` 进拓扑的，只存进 ArcSwap 还不够 —— 邻居会等到下一次周期刷新
+        // 才知道。这里补一次同步与广播（§5.5）。
+        crate::gossip::sync_self_state(&self.state);
         self.state.emit_topology();
         for w in warns {
             self.state.log("warn", "config", w);
         }
-        if listen_changed {
-            self.state.log(
-                "warn",
-                "config",
-                "listen 已改动：端口/绑定地址的变化需要重启进程才会真正生效",
-            );
-        }
-        if proxy_changed {
-            self.state.log("warn", "config", "proxy 已改动：SOCKS5 绑定地址变化需要重启进程");
-        }
         if discovery_changed || peers_changed {
             self.state.log("info", "config", "发现/种子配置已更新，拨号器会在下一轮巡检采用");
         }
+        Ok(())
+    }
+
+    /// 应用一份新配置：热字段直接生效，绑定类字段**原地重绑**（不重建引擎）。
+    ///
+    /// 返回本次的档位，供调用方记录/回显。
+    ///
+    /// ★ 顺序是"先停旧的（并且**等它真的停**）→ 再绑新的 → 绑不上就把旧的绑回来"。
+    /// 为什么不能"先绑新的、成了再换"：端口重叠（`[5678, 5679]` → `[5678]`）时新端口
+    /// 根本绑不上 —— 那个端口还在自己手里。而先停后绑只要"停"是确定的，回滚就一定成功
+    /// （旧端口刚从我们手里放走，大概率还空着）；真有人在这零点几秒里抢走了它，
+    /// 就大声说出来，绝不假装还在听（§6.2.3 的"不静默降级"）。
+    pub async fn apply_config(self: &Arc<Self>, cfg: Config) -> Result<ConfigChange, String> {
+        let old = self.state.cfg().as_ref().clone();
+        let change = crate::config::classify_change(&old, &cfg);
+        if change.engine {
+            return Err(
+                "这份配置改了身份或网段表（node.* / share.subnet_deny* / admin.*），\
+                 需要重建引擎 —— 应当由 ServiceHandle::restart 处理"
+                    .into(),
+            );
+        }
+        if !change.listen && !change.proxy {
+            self.set_config(cfg)?;
+            return Ok(change);
+        }
+
+        // ★ **只动真正变了的那一侧。**
+        //
+        // 第一版是"两边一起重绑"，结果是：只改入向端口，却因为代理端口被别的程序占着
+        // 而整体失败 —— 而且回滚也拿不回入向端口（回滚同样在代理那一步就退出了），
+        // 最后**一个端口都不在听**。这台机器的 1080 恰好被人占着，CLI 冒烟测试直接踩中。
+        // 现在每个子系统各管各的：改入向端口时压根不碰代理。
+        let mut stopped: Vec<Sub> = Vec::new();
+        let mut fail: Option<String> = None;
+
+        if change.listen {
+            self.stop_listen().await;
+            stopped.push(Sub::Listen);
+            if let Err(e) = self.spawn_listen(&cfg, true).await {
+                fail = Some(format!("入向端口 {e}"));
+            }
+        }
+        if fail.is_none() && change.proxy {
+            self.stop_proxy().await;
+            stopped.push(Sub::Proxy);
+            if let Err(e) = self.spawn_proxy(&cfg, true).await {
+                fail = Some(format!("本地代理 {e}"));
+            }
+        }
+
+        if let Some(cause) = fail {
+            // 回滚：把**停过的**那一侧按原配置重新绑上（没动过的一侧绝不碰）
+            let mut bad: Vec<String> = Vec::new();
+            for sub in stopped.iter().rev() {
+                let r = match sub {
+                    Sub::Listen => self.spawn_listen(&old, true).await,
+                    Sub::Proxy => self.spawn_proxy(&old, true).await,
+                };
+                if let Err(e) = r {
+                    bad.push(e);
+                }
+            }
+            let msg = if bad.is_empty() {
+                format!("绑定失败，已保留原端口：{cause}")
+            } else {
+                format!(
+                    "绑定失败（{cause}），且回滚也失败（{}）：那一部分现在没有任何端口在听",
+                    bad.join("；")
+                )
+            };
+            self.state.log("error", "config", msg.clone());
+            return Err(msg);
+        }
+
+        // 提交配置。**必须在重绑之后**：`proxy::serve` 一开跑就读配置里的绑定地址与
+        // allow_remote，反过来的话它会读到旧值。
+        self.set_config(cfg)?;
+        crate::gossip::broadcast_now(&self.state, true).await;
+
+        self.state.log(
+            "info",
+            "config",
+            format!("监听端点已重新绑定（{}）—— 在途连接不受影响", change_label(change)),
+        );
+        Ok(change)
+    }
+
+    /// 停掉入向端口的 accept loop，并等它们真的退出（端口才真的腾出来）。
+    async fn stop_listen(&self) {
+        let tasks: Vec<JoinHandle<()>> = std::mem::take(&mut *self.listen_tasks.lock());
+        abort_all(tasks).await;
+        self.state.listen_bound.write().clear();
+    }
+
+    /// 停掉本地代理的 accept loop。
+    async fn stop_proxy(&self) {
+        let task = self.proxy_task.lock().take();
+        if let Some(t) = task {
+            abort_all(vec![t]).await;
+        }
+        *self.state.proxy_bound.write() = None;
+    }
+
+    /// 按配置绑入向端口并起 accept loop。
+    ///
+    /// - `strict = false`（冷启动）：单个端口绑不上只告警，节点照起 ——
+    ///   端口被人占了也得能起来，否则用户没有界面可改（§6.2.3、docs/WEBUI.md §2.1）；
+    /// - `strict = true`（改配置）：全有全无，任何一个失败就整体报错（调用方负责回滚）。
+    async fn spawn_listen(&self, cfg: &Config, strict: bool) -> Result<(), String> {
+        let ports = if cfg.listen.ports.is_empty() { vec![5678] } else { cfg.listen.ports.clone() };
+        let mut listeners = Vec::new();
+        let mut bound = Vec::new();
+
+        for port in ports {
+            match crate::listener::bind_one(cfg.listen.bind, port).await {
+                Ok(l) => {
+                    bound.extend(bound_addrs(&l));
+                    listeners.push(l);
+                }
+                Err(e) if strict => return Err(e),
+                Err(e) => {
+                    // ★ 必须显式告警：静默降级会让"端口对齐"变成一个看不见的失败
+                    self.state.log("error", "listener", format!(
+                        "{e} —— 这个入向孔洞对本机不可用，其它节点拨不进来（§6.2.3）。\
+                         端口可能已被别的服务占用，或需要更高权限。"
+                    ));
+                }
+            }
+        }
+
+        *self.state.listen_bound.write() = bound;
+        *self.listen_tasks.lock() = crate::listener::spawn_on(self.state.clone(), listeners);
+        Ok(())
+    }
+
+    /// 按配置绑本地代理端口并起 accept loop。
+    ///
+    /// ⚠️ 这里失败**不能**影响入向端口：两者互不相干，而且代理端口被别的程序占着是常态
+    /// （这台开发机上就是），没理由因此连入向端口一起废掉。
+    async fn spawn_proxy(&self, cfg: &Config, strict: bool) -> Result<(), String> {
+        let listener = match crate::proxy::bind_one(cfg.proxy.bind).await {
+            Ok(l) => l,
+            Err(e) if strict => return Err(e),
+            Err(e) => {
+                self.state.log("error", "proxy", e);
+                return Ok(());
+            }
+        };
+        *self.state.proxy_bound.write() = listener.local_addr().ok();
+        *self.proxy_task.lock() = Some(crate::proxy::spawn_on(self.state.clone(), listener));
         Ok(())
     }
 
@@ -836,12 +1008,7 @@ impl HiveNode {
     /// 把当前监听端口广播出去（`listen.advertise` 打开时才有内容）。
     pub fn listen_advert(&self) -> Vec<SocketAddr> {
         self.state
-            .node
-            .listen_advert(
-                self.state.cfg().listen.advertise,
-                now_unix(),
-                900,
-            )
+            .listen_advert(self.state.cfg().listen.advertise, now_unix(), 900)
             .addrs
     }
 
@@ -886,6 +1053,47 @@ impl HiveNode {
     /// 读一份配置模板（首次启动时写的）。
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+}
+
+/// 绑定类的两个子系统。分开是为了"只动变了的那一个"。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sub {
+    Listen,
+    Proxy,
+}
+
+/// `abort()` 只是"请求取消"；`await` 之后任务才真的被丢弃、`TcpListener` 才真的关闭。
+async fn abort_all(tasks: Vec<JoinHandle<()>>) {
+    for t in &tasks {
+        t.abort();
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+}
+
+/// 一个监听器"实际在听哪里"。
+///
+/// `0.0.0.0:5678` 这种通配绑定要**展开成各网卡的具体地址**：对界面和运维来说
+/// "我该拨哪个地址"才是他们要的答案，`0.0.0.0` 只是内核的一个写法。
+/// 展开走的是 `net::expand_listen_addrs`，与身份里那份初始猜测同一套规则。
+fn bound_addrs(l: &tokio::net::TcpListener) -> Vec<SocketAddr> {
+    match l.local_addr() {
+        // 通配绑定展开成各网卡的具体地址（多网卡时是好几行）
+        Ok(a) if a.ip().is_unspecified() => crate::net::expand_listen_addrs(a.ip(), &[a.port()]),
+        Ok(a) => vec![a],
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 档位的人话说法（日志与界面共用同一套措辞）。
+fn change_label(c: ConfigChange) -> String {
+    match (c.listen, c.proxy) {
+        (true, true) => "入向端口与本地代理".to_string(),
+        (true, false) => "入向端口".to_string(),
+        (false, true) => "本地代理端口".to_string(),
+        (false, false) => "配置".to_string(),
     }
 }
 

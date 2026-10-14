@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
+use tokio::task::JoinHandle;
 
 use crate::handshake::accept_and_handshake;
 use crate::proto::Establisher;
@@ -21,37 +21,34 @@ pub async fn bind_one(bind: std::net::IpAddr, port: u16) -> Result<TcpListener, 
         .map_err(|e| format!("{bind}:{port} 绑定失败：{e}"))
 }
 
-/// 启动全部监听端口。
-pub fn spawn_listeners(state: Arc<HiveState>, cancel: CancellationToken) {
-    let cfg = state.cfg();
-    let bind = cfg.listen.bind;
-    let ports = if cfg.listen.ports.is_empty() { vec![5678] } else { cfg.listen.ports.clone() };
-
-    for port in ports {
-        let st = state.clone();
-        let c = cancel.clone();
-        tokio::spawn(async move {
-            match bind_one(bind, port).await {
-                Ok(listener) => {
-                    st.log("info", "listener", format!("正在监听 {bind}:{port}（IT 授权给本机的入向端口）"));
-                    accept_loop(st, listener, c).await;
+/// 在**已经绑好**的监听器上起 accept loop，返回任务句柄。
+///
+/// ★ 返回句柄是必需的，不是顺手：取消令牌是**异步**的 —— 取消之后旧任务要等到被调度
+/// 才会丢掉那个 `TcpListener`。改端口时如果不等它真的死掉就去绑新端口，
+/// 换端口重叠的场景必然 `EADDRINUSE`（这个 bug 是被 `tests/rebind.rs` 抓出来的）。
+/// `abort()` + `await` 才能让"旧端口已经腾出来"变成确定的事。
+///
+/// 绑端口不在这里做：冷启动与重绑要共用同一段"先绑、再起"的代码，
+/// 而冷启动对单个端口绑失败是**容忍**的（§6.2.3，只告警不阻断启动），
+/// 重绑则是全有全无。两种策略只能在调用方选。
+pub fn spawn_on(state: Arc<HiveState>, listeners: Vec<TcpListener>) -> Vec<JoinHandle<()>> {
+    listeners
+        .into_iter()
+        .map(|listener| {
+            let st = state.clone();
+            tokio::spawn(async move {
+                if let Ok(addr) = listener.local_addr() {
+                    st.log("info", "listener", format!("正在监听 {addr}（IT 授权给本机的入向端口）"));
                 }
-                Err(e) => {
-                    // ★ 必须显式告警：静默降级会让"端口对齐"变成一个看不见的失败
-                    st.log("error", "listener", format!(
-                        "{e} —— 这个入向孔洞对本机不可用，其它节点拨不进来（§6.2.3）。\
-                         端口可能已被别的服务占用，或需要更高权限。"
-                    ));
-                }
-            }
-        });
-    }
+                accept_loop(st, listener).await;
+            })
+        })
+        .collect()
 }
 
-async fn accept_loop(state: Arc<HiveState>, listener: TcpListener, cancel: CancellationToken) {
+async fn accept_loop(state: Arc<HiveState>, listener: TcpListener) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
             _ = state.shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 let (stream, remote) = match accepted {

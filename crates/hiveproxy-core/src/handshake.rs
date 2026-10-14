@@ -321,7 +321,7 @@ async fn accept_inner(
         nonce: nonce_b,
         features: crate::proto::features::NONE,
         session_id,
-        listen_ports: state.node.listen_ports(),
+        listen_ports: state.listen_ports_live(),
         auth: if cfg.security.join_token.is_empty() {
             None
         } else {

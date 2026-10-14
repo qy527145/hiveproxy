@@ -19,6 +19,7 @@ pub struct Config {
     pub security: SecurityCfg,
     pub service: ServiceCfg,
     pub admin: AdminCfg,
+    pub web: WebCfg,
     pub log: LogCfg,
 }
 
@@ -232,6 +233,37 @@ impl Default for AdminCfg {
     }
 }
 
+/// Web 界面（docs/WEBUI.md）。
+///
+/// ★ **只有 `hiveproxy-cli` 会读这一节并启动它**；桌面端（Tauri）从不启动 web 服务。
+/// 这是一条硬边界，不是约定 —— "只做 CLI 侧"就落在这里。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebCfg {
+    /// 关掉它就等于回到"只有管理 socket"的老样子（剪贴板里那些 `nc -U` 用法照旧）。
+    pub enabled: bool,
+    /// 默认监听局域网。改 `127.0.0.1:10801` = 只允许本机 / SSH 隧道。
+    ///
+    /// ★ 端口选 10801 而不是 10800：`admin.tcp` 在非 Unix 平台的默认值就是 10800，
+    /// 两个都是 TCP，Windows 上会撞。
+    pub bind: SocketAddr,
+    /// `Host` 头校验的额外白名单 —— 反代用了域名时填这里。
+    ///
+    /// 这条校验挡的是 **DNS rebinding**：攻击页面必然带着一个域名来，
+    /// 而正常的访问者带的是本机地址或 `localhost`（见 `web.rs`）。
+    pub allowed_hosts: Vec<String>,
+}
+
+impl Default for WebCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: "0.0.0.0:10801".parse().expect("字面量"),
+            allowed_hosts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogCfg {
@@ -256,6 +288,7 @@ impl Default for Config {
             security: SecurityCfg::default(),
             service: ServiceCfg::default(),
             admin: AdminCfg::default(),
+            web: WebCfg::default(),
             log: LogCfg::default(),
         }
     }
@@ -408,6 +441,25 @@ impl Config {
                 ));
             }
         }
+        // web 界面默认监听局域网，这是本项目里唯一一处主动扩大攻击面的默认值 ——
+        // 它靠令牌 + Origin/Host 校验兜住，但**令牌在网段里是明文**，配置改不掉。必须说出来。
+        if self.web.enabled && !self.web.bind.ip().is_loopback() {
+            warns.push(format!(
+                "web.bind = {} 监听在非回环地址：界面靠令牌认证，但令牌与全部数据在网段里是**明文 HTTP**。\
+                 想更安全就把 enabled 关掉或 bind 改回环，用 `ssh -L {}:127.0.0.1:{}` 访问（docs/WEBUI.md §6）",
+                self.web.bind,
+                self.web.bind.port(),
+                self.web.bind.port()
+            ));
+        }
+        if self.web.enabled && self.web.bind.ip().is_unspecified() && self.web.allowed_hosts.is_empty() {
+            // 不是错误，只是提醒：反代用了域名就必须填白名单，否则 Host 校验会把它挡在门外
+            warns.push(
+                "web.bind 是通配地址且 web.allowed_hosts 为空：直接用 IP 访问没问题，\
+                 但前面挂反代（带域名）时要往 allowed_hosts 里加域名"
+                    .to_string(),
+            );
+        }
         if self.route.gossip_flood_ttl == 0 {
             warns.push(
                 "gossip_flood_ttl = 0 会让拓扑只传播 1 跳，四节点链以上无法路由（§6.3）".to_string(),
@@ -477,6 +529,79 @@ impl Config {
             .find(|e| e.alias == alias)
             .and_then(|e| parse_peer_address(&e.address).ok())
             .and_then(|(ip, port)| port.map(|p| SocketAddr::new(ip, p)))
+    }
+}
+
+/// 一份配置改动的**生效档位**（docs/WEBUI.md §5）。
+///
+/// 分散在各处的 `if old.x != new.x` 迟早会漏掉一个字段，而漏掉的症状是
+/// "改完看着保存成功了、其实没生效" —— 所以集中在这里，并且**由测试钉住**。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigChange {
+    /// 要重新绑定入向端口（`listen.bind` / `listen.ports`）。
+    pub listen: bool,
+    /// 要重新绑定本地代理端口（`proxy.bind`）。
+    pub proxy: bool,
+    /// 要重建整个引擎 —— 身份变了，或者网段表变了（`NodeIdentity` 是 `Arc`，改不了它的内容）。
+    pub engine: bool,
+}
+
+impl ConfigChange {
+    /// 热生效：不用重绑、更不用重建。
+    pub fn is_hot(self) -> bool {
+        !self.listen && !self.proxy && !self.engine
+    }
+}
+
+/// 比较两份配置，给出各档位是否要动作。
+///
+/// ★ `listen.max_links` **不算** `listen` 档：它每个 accept 都现读配置，
+/// 把它算进来的话，改一次上限就会去重绑同一个端口 —— 那是必然的 `EADDRINUSE`。
+pub fn classify_change(old: &Config, new: &Config) -> ConfigChange {
+    ConfigChange {
+        listen: old.listen.bind != new.listen.bind || old.listen.ports != new.listen.ports,
+        proxy: old.proxy.bind != new.proxy.bind,
+        engine: old.node != new.node
+            || old.share.auto_share_subnets != new.share.auto_share_subnets
+            || old.share.subnet_deny != new.share.subnet_deny
+            || old.share.subnet_deny_ifaces != new.share.subnet_deny_ifaces
+            || old.admin != new.admin,
+    }
+}
+
+/// 把某个字段动一下（测试用）。
+///
+/// 每个改动都保证**真的改了值** —— 否则 `classify_change` 看到的是同一份配置，
+/// 测试会假绿。Rust 没有反射，路径 → 字段这张表只能在测试里手写一遍；
+/// 写错了这条测试会直接报"某档位不对"，不会静默放过。
+#[cfg(test)]
+fn poke(cfg: &mut Config, path: &str) {
+    match path {
+        "listen.bind" => cfg.listen.bind = "127.0.0.2".parse().unwrap(),
+        "listen.ports" => cfg.listen.ports = vec![5699],
+        "listen.max_links" => cfg.listen.max_links += 1,
+        "listen.advertise" => cfg.listen.advertise = !cfg.listen.advertise,
+        "proxy.bind" => cfg.proxy.bind = "127.0.0.1:1099".parse().unwrap(),
+        "proxy.allow_remote" => cfg.proxy.allow_remote = !cfg.proxy.allow_remote,
+        "node.overlay_addr" => cfg.node.overlay_addr = Some("10.9.9.9".parse().unwrap()),
+        "node.alias" => cfg.node.alias = Some("poke".into()),
+        "node.zone" => cfg.node.zone = Some(7),
+        "share.auto_share_subnets" => cfg.share.auto_share_subnets = !cfg.share.auto_share_subnets,
+        "share.share_ports_only" => cfg.share.share_ports_only = vec![5678],
+        "share.subnet_deny" => cfg.share.subnet_deny.push("10.99.0.0/16".into()),
+        "share.subnet_deny_ifaces" => cfg.share.subnet_deny_ifaces.push("poke*".into()),
+        "admin.enabled" => cfg.admin.enabled = !cfg.admin.enabled,
+        "admin.socket" => cfg.admin.socket = "/tmp/poke.sock".into(),
+        "admin.tcp" => cfg.admin.tcp = Some("127.0.0.1:10999".parse().unwrap()),
+        "route.rules" => {
+            cfg.route.rules.push(crate::rules::Rule::new(
+                crate::rules::HostMatcher::parse("poke.example.com").unwrap(),
+                crate::rules::PortMatcher::Any,
+                crate::rules::EgressTarget::Auto,
+            ))
+        }
+        "peers.seeds" => cfg.peers.seeds.push("10.1.2.3:5678".into()),
+        other => panic!("poke 里没有 `{other}` —— 加了字段就把它补上"),
     }
 }
 
@@ -650,5 +775,99 @@ mod tests {
         let mut c2 = c;
         c2.route.rules.push(r);
         assert!(c2.validate().iter().any(|w| w.contains("无边界")));
+    }
+
+    /// 生效档位的**唯一权威表**（docs/WEBUI.md §5.1）。
+    ///
+    /// 这份表要同时管住三件事，所以它只有一处：
+    /// ① 引擎的 `classify_change` 真按它分档；② web 界面的提示文案（`configSpec.ts`）；
+    /// ③ 上面那条 `poke` 认得这些路径。
+    const TIER_TABLE: &[(&str, &str)] = &[
+        // ② 引擎内重绑 —— 只有"要换监听 socket"的这三个
+        ("listen.bind", "rebind"),
+        ("listen.ports", "rebind"),
+        ("proxy.bind", "rebind"),
+        // 下面两个**特意钉成热生效**：它们是每个连接现读配置的。
+        // 把 `max_links` 算进重绑档的话，改一次上限就会去绑同一个端口 —— 必然 EADDRINUSE。
+        ("listen.max_links", "hot"),
+        ("proxy.allow_remote", "hot"),
+        // ③ 重建引擎（身份 / 网段表 / 管理接口端点）
+        ("node.overlay_addr", "rebuild"),
+        ("node.alias", "rebuild"),
+        ("node.zone", "rebuild"),
+        ("share.auto_share_subnets", "rebuild"),
+        ("share.subnet_deny", "rebuild"),
+        ("share.subnet_deny_ifaces", "rebuild"),
+        ("admin.enabled", "rebuild"),
+        ("admin.socket", "rebuild"),
+        ("admin.tcp", "rebuild"),
+        // ① 热生效的抽样（不是全集，只需要有代表性）
+        ("route.rules", "hot"),
+        ("peers.seeds", "hot"),
+        ("share.share_ports_only", "hot"),
+        ("listen.advertise", "hot"),
+    ];
+
+    #[test]
+    fn classify_change_puts_each_field_in_the_right_tier() {
+        let base = Config::default();
+        for (path, want) in TIER_TABLE {
+            let mut c = base.clone();
+            poke(&mut c, path);
+            let ch = classify_change(&base, &c);
+            let got = if ch.engine {
+                "rebuild"
+            } else if ch.listen || ch.proxy {
+                "rebind"
+            } else {
+                "hot"
+            };
+            assert_eq!(got, *want, "`{path}` 的档位不对（want {want}）——{ch:?}");
+        }
+    }
+
+    /// ★ 守卫：前端的档位表必须和 `TIER_TABLE` 一致。
+    ///
+    /// 这两张表漂了不会报错，只会让界面**说错话**："改了会重绑"实际热生效（或反过来，
+    /// 用户以为不用管，结果断了所有连接）。第一次接前端时就漂过一次
+    /// （`listen.max_links` / `proxy.allow_remote` 被标成了重绑档），所以钉住。
+    #[test]
+    fn frontend_tier_table_matches_the_backend() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../src/lib/configSpec.ts");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()));
+
+        // FIELD_EFFECT 段里那些 `"路径": "档位",` 的行
+        let start = text.find("FIELD_EFFECT").expect("configSpec.ts 里应当有 FIELD_EFFECT");
+        let end = text[start..].find("};").expect("FIELD_EFFECT 应当以 }; 收尾") + start;
+        let mut ts: Vec<(String, String)> = Vec::new();
+        for line in text[start..end].lines() {
+            let line = line.trim();
+            if !line.starts_with('"') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once("\":") else { continue };
+            let k = k.trim().trim_start_matches('"').trim();
+            let v = v.trim().trim_end_matches(',').trim().trim_matches('"');
+            if matches!(v, "hot" | "rebind" | "rebuild") {
+                ts.push((k.to_string(), v.to_string()));
+            }
+        }
+        assert!(!ts.is_empty(), "没能从 configSpec.ts 里解析出任何档位条目");
+
+        let mut want: Vec<(String, String)> = TIER_TABLE
+            .iter()
+            .filter(|(_, t)| *t != "hot") // 前端只列非热生效的，热生效是默认档
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+        ts.sort();
+        want.sort();
+
+        assert_eq!(
+            ts, want,
+            "前端 configSpec.ts 的 FIELD_EFFECT 与后端的 TIER_TABLE 不一致 —— \
+             界面上的提示会说错话（两边都不报错，只是说法不对）"
+        );
     }
 }

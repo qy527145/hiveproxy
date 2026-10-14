@@ -108,7 +108,8 @@ pub async fn dial_pass(state: &Arc<HiveState>) {
         }
         // 只跳过**自己的监听端点**，而不是"所有本机 IP"。
         // 后者会误杀同机上另一个端口的节点（容器 / 多实例 / 测试都会踩到）。
-        if state.node.listen.contains(&addr) {
+        // 用实际绑上的那份（`listen_addrs`）：端口改过之后，老地址已经不在听了。
+        if state.listen_addrs().contains(&addr) {
             continue;
         }
         if covered_by_existing_link(state, addr) {

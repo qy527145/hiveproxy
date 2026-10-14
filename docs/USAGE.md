@@ -207,14 +207,40 @@ ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:1080 %h %p' user@10.4.0.9
 
 ## 7. 没有图形界面的服务器
 
-装 `hiveproxy-cli`（与桌面版是同一套引擎，能力完全一致）：
+装 `hiveproxy-cli`（与桌面版是同一套引擎，**连界面都是同一份**）：
 
 ```bash
-hiveproxy-cli init                          # 生成 hiveproxy.toml
-vi hiveproxy.toml                           # 至少改 [listen] ports 与 [peers] seeds
-hiveproxy-cli check                         # 校验（有告警会列出来）
-hiveproxy-cli run                           # 前台运行，Ctrl-C 优雅退出
+hiveproxy-cli run                           # 引擎 + web 界面一起起来，Ctrl-C 优雅退出
 ```
+
+**不需要预先准备配置文件** —— 没有就自动写一份默认的，之后全部在 web 界面上改。
+启动时会打印地址和**一次性令牌**：
+
+```
+┌─ hiveproxy web 界面 ─────────────────────────────────────────
+│  地址  http://10.4.0.12:10801/
+│  令牌  3K09-3WRR-GX7R-HMFS-10K0
+│         ↑ 首次登录用，进去之后会被要求改掉（之后不再打印）
+└──────────────────────────────────────────────────────────────
+```
+
+浏览器打开那个地址，用这串令牌登录，**第一次登录会强制你把它改成自己的**。
+改完就可以像桌面版一样操作了 —— 同一份界面、同一套能力。
+
+改配置**不需要重启**：绝大多数（规则、出口、种子、发现……）点保存即生效；
+改入向端口或本地代理端口会当场**重新绑定**（在途连接不受影响）；
+只有改身份地址、别名、网段排除表这类才会重建引擎（约 1 秒，界面不断线）。
+
+```bash
+hiveproxy-cli run --no-web                  # 只想跑引擎（回到老样子）
+hiveproxy-cli run --web-bind 127.0.0.1:10801  # 只允许本机访问（配合 SSH 隧道）
+hiveproxy-cli web-token                     # 看令牌状态
+hiveproxy-cli web-token --reset             # 忘了令牌时的出路：生成新的一次性令牌
+```
+
+> ⚠️ **默认监听局域网，而且是明文 HTTP** —— 界面本身靠令牌认证，但令牌在网上是明文的。
+> 想更安全就 `--web-bind 127.0.0.1:10801`，用 `ssh -L 10801:127.0.0.1:10801 用户@那台机器`
+> 从本机浏览器访问；或者在前面放一个带 TLS 的反向代理。
 
 跑起来之后，**不用重启**就能查询和修改：
 
@@ -247,7 +273,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/hiveproxy-cli run --config /etc/hiveproxy/hiveproxy.toml --data-dir /var/lib/hiveproxy
+# --config 不再必需：数据目录里没有配置就自动生成一份
+ExecStart=/usr/local/bin/hiveproxy-cli run --data-dir /var/lib/hiveproxy
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=info
@@ -262,6 +289,8 @@ journalctl -u hiveproxy -f
 hiveproxy-cli -c /etc/hiveproxy/hiveproxy.toml status
 ```
 
-> 管理接口**没有任何认证**，因此只允许绑回环地址或 Unix socket；配置成外部地址会被直接拒绝启动。
+> 管理接口（给 `nc` 和脚本用的那条 Unix socket）**没有任何认证**，因此只允许绑回环地址或
+> Unix socket；配置成外部地址会被直接拒绝启动。web 界面是**另一条**通道，它有自己的令牌认证
+> —— 两者的安全模型不要混起来看。
 > 需要远程管理就在外面套 SSH：
 > `ssh server 'hiveproxy-cli -c /etc/hiveproxy/hiveproxy.toml status'`

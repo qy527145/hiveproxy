@@ -4,6 +4,7 @@
 //! 分层见 DESIGN.md §4：L1 链路 / L2 帧 / L3 路由 / L4 会话 / L5 应用出口。
 
 pub mod admin;
+pub mod api;
 pub mod config;
 pub mod dialer;
 pub mod discovery;
@@ -26,12 +27,14 @@ pub mod resolver;
 pub mod router;
 pub mod rules;
 pub mod session;
+pub mod service;
 pub mod socks5;
 pub mod state;
 pub mod stream;
 pub mod stats;
 pub mod topology;
 pub mod view;
+pub mod web;
 pub mod zone;
 
 #[cfg(test)]

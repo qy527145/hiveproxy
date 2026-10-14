@@ -17,8 +17,6 @@ export interface ConfigField {
   /** `select` 的选项。 */
   options?: string[];
   hint?: string;
-  /** ★ = 改动需要重启服务才生效。 */
-  star?: boolean;
   /** 留空 → `null`（对应 Rust 的 `Option<T>`）。 */
   nullable?: boolean;
   /** 输入框的占位提示。 */
@@ -28,6 +26,68 @@ export interface ConfigField {
 export interface ConfigSection {
   title: string;
   fields: ConfigField[];
+}
+
+/* ────────────────────────────── 生效档位（DESIGN.md §21 / WEBUI.md §5）────────────────────────────── */
+
+/**
+ * 配置改完**怎么才算生效**。三档（外加一个"改不了、得重启进程"的部署档，那种字段根本不进界面）：
+ *
+ * - `hot`     热生效：点保存就落定，界面不抖、连接不断。**默认档**，所以不列在表里。
+ * - `rebind`  引擎内重绑：取消子令牌 → 重新 bind → 重起 accept loop。在途连接不受影响。
+ * - `rebuild` 重建引擎：停引擎 → 原地重建。会断开全部链路与在途流，约 1 秒。
+ *
+ * ★ 这张表是"标 ★ 的改动需要重启吗 / 具体哪一档"的**唯一来源**：文案与 ★ 都由它推出来，
+ * 不再散在字段的 hint 和字段名里各写一遍（那才会漂移）。
+ */
+export type EffectTier = "hot" | "rebind" | "rebuild";
+
+/** 非热生效档位的提示语。`hot` 空串 = 不提示。 */
+export const EFFECT_HINTS: Record<EffectTier, string> = {
+  hot: "",
+  rebind: "端口将重新绑定，在途连接不受影响",
+  rebuild: "将重建引擎，断开现有连接",
+};
+
+/** 档位轻重：hot < rebind < rebuild。取一段里"最重"的那档给标题用。 */
+const TIER_RANK: Record<EffectTier, number> = { hot: 0, rebind: 1, rebuild: 2 };
+
+/**
+ * 字段路径 → 生效档位。**只列非热生效的**（没列到的一律热生效）。
+ * 与 DESIGN.md §21 / WEBUI.md §5.1 的三档表逐项对应；改那边就要改这里。
+ */
+export const FIELD_EFFECT: Record<string, EffectTier> = {
+  // ② 引擎内重绑。**只有"要换监听 socket"的那两个** ——
+  // `listen.max_links` 与 `proxy.allow_remote` 不在此列：它们是每个连接现读配置的，
+  // 改完即生效，重绑一次纯属白断连接（引擎侧同一份判断在 config::classify_change）。
+  "listen.bind": "rebind",
+  "listen.ports": "rebind",
+  "proxy.bind": "rebind",
+  // ③ 重建引擎（改地址 / zone 等于换一台机器，语义上就不该热更）
+  "node.overlay_addr": "rebuild",
+  "node.alias": "rebuild",
+  "node.zone": "rebuild",
+  "share.auto_share_subnets": "rebuild",
+  "share.subnet_deny": "rebuild",
+  "share.subnet_deny_ifaces": "rebuild",
+  "admin.enabled": "rebuild",
+  "admin.socket": "rebuild",
+  "admin.tcp": "rebuild",
+};
+
+/** 某个字段的生效档位；没列的按热生效。 */
+export function effectTier(path: string): EffectTier {
+  return FIELD_EFFECT[path] ?? "hot";
+}
+
+/** 一段配置里"最重"的生效档位 —— 用于给 section 标题配一句说明。 */
+export function sectionEffect(fields: ConfigField[]): EffectTier {
+  let worst: EffectTier = "hot";
+  for (const f of fields) {
+    const t = effectTier(f.path);
+    if (TIER_RANK[t] > TIER_RANK[worst]) worst = t;
+  }
+  return worst;
 }
 
 export const CONFIG_SECTIONS: ConfigSection[] = [
@@ -58,13 +118,12 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
     ],
   },
   {
-    title: "监听（★ 改动需重启服务）",
+    title: "监听",
     fields: [
       {
         path: "listen.ports",
         label: "ports",
         type: "numlist",
-        star: true,
         placeholder: "用逗号分隔，如 5678, 5679",
         hint: "★ 监听端口 = IT 授权给这台机器的入向端口。别人就是拨这个端口找到你；它必须与对端 seeds 里写的端口一致",
       },
@@ -72,7 +131,6 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
         path: "listen.bind",
         label: "bind",
         type: "text",
-        star: true,
         hint: "监听的网卡地址（不含端口）",
       },
       { path: "listen.max_links", label: "max_links", type: "number", hint: "同时维持的最大直连链路数" },
@@ -194,13 +252,12 @@ export const CONFIG_SECTIONS: ConfigSection[] = [
     ],
   },
   {
-    title: "本地代理（★ 改动需重启服务）",
+    title: "本地代理",
     fields: [
       {
         path: "proxy.bind",
         label: "bind",
         type: "text",
-        star: true,
         hint: "本机应用要连的本地代理地址。同一个端口同时支持 SOCKS5 与 HTTP 代理，默认 127.0.0.1:1080（首页有快捷入口）",
       },
       {

@@ -20,26 +20,41 @@ SOCKS5 与 HTTP 代理**）—— 之后你照常填真实的内网 `ip:端口`�
 | 入口 | 产物 | 面向 |
 | :--- | :--- | :--- |
 | 桌面版 | `hiveproxy`（Tauri v2） | 日常使用：拓扑 DAG、规则编辑、配置表单、日志 |
-| 命令行版 | `hiveproxy-cli` | **无界面的 Linux 服务器 / 容器 / systemd** |
+| 命令行版 | `hiveproxy-cli` | **无界面的 Linux 服务器 / 容器 / systemd**（自带 web 界面） |
 | 库 | `hiveproxy-core` | 嵌入到别的程序里 |
 
 CLI 与 GUI 通过同一个**本地管理接口**操作同一个引擎，能力完全一致：
 
 ```bash
-hiveproxy-cli init && vi hiveproxy.toml     # 生成并编辑配置
-hiveproxy-cli check                          # 只校验配置
-hiveproxy-cli run --status-interval 30       # 前台运行（systemd 直接用）
+hiveproxy-cli run --status-interval 30       # 引擎 + web 界面一起起来（不需要先备配置文件）
 hiveproxy-cli status | nodes | rules | probe 10.4.0.9:3389
 hiveproxy-cli reload | publish | revoke | bypass false | seed-add 10.1.2.3:20000
 ```
 
-这些子命令是在**跟正在运行的节点说话**，不需要重启。`nc` 也能直接用：
+### 服务器上没有图形界面？
+
+`hiveproxy-cli run` 会额外开一个 web 服务，**渲染的就是桌面端那一份界面**（同一份前端代码）。
+启动时打印地址和一次性令牌：
+
+```bash
+hiveproxy-cli run
+#  地址  http://10.4.0.12:10801/
+#  令牌  3K09-3WRR-GX7R-HMFS-10K0     ← 首次登录用，进去后会被要求改掉
+```
+
+浏览器打开即可，**不需要预先准备配置文件**，改配置也不用重启：
+端口改动会原地重新绑定（在途连接不断），只有改身份才会重建引擎（界面不断线）。
+
+想只允许本机访问：`hiveproxy-cli run --web-bind 127.0.0.1:10801`，再 `ssh -L` 转发。
+详见 [docs/WEBUI.md](docs/WEBUI.md)。
+
+那几条子命令是在**跟正在运行的节点说话**，不需要重启。`nc` 也能直接用：
 
 ```bash
 echo status | nc -U /var/lib/hiveproxy/data/hiveproxy.sock
 ```
 
-详见 [docs/DESIGN.md](docs/DESIGN.md) §20。
+详见 [docs/DESIGN.md](docs/DESIGN.md) §20、§21。
 
 ## 工程结构
 

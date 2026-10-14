@@ -64,9 +64,7 @@ pub async fn build_announcement(state: &Arc<HiveState>) -> GossipMsg {
         seq,
         edges,
         subnets,
-        listen: state
-            .node
-            .listen_advert(cfg.listen.advertise, now_unix(), 900),
+        listen: state.listen_advert(cfg.listen.advertise, now_unix(), 900),
         accepts_egress: cfg.egress.allow_egress,
         alias: state.node.alias.clone(),
         rule_set,
@@ -108,7 +106,7 @@ pub fn sync_self_state(state: &Arc<HiveState>) {
             false => SubnetAd { net: *n, ports: Some(cfg.share.share_ports_only.clone()) },
         })
         .collect();
-    let listen = state.node.listen_advert(cfg.listen.advertise, now_unix(), 900);
+    let listen = state.listen_advert(cfg.listen.advertise, now_unix(), 900);
     let mut topo = state.topology.write();
     topo.set_self(current_edges(state), subnets, listen, cfg.egress.allow_egress, state.node.alias.clone());
 }

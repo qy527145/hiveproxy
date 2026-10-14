@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
-import { CONFIG_SECTIONS, getPath, setPath, type ConfigField } from "../lib/configSpec";
+import {
+  CONFIG_SECTIONS,
+  EFFECT_HINTS,
+  effectTier,
+  getPath,
+  sectionEffect,
+  setPath,
+  type ConfigField,
+} from "../lib/configSpec";
 import type { Config } from "../lib/types";
 import { ListEditor } from "../components/ListEditor";
 import { Panel, Row } from "../components/ui";
@@ -115,8 +123,8 @@ export function ConfigView() {
         title="配置"
         hint={
           <>
-            改动即时生效并落盘。标 <span className="star">★</span> 的改动（监听端口、绑定地址、本地代理
-            地址）需要重启服务。
+            改动即时生效并落盘。标 <span className="star">★</span> 的改动按生效档位分两种：重新绑定端口
+            （在途连接不受影响）、或重建引擎（断开现有连接）—— 具体是哪一档写在各自的段落标题上。
           </>
         }
         actions={
@@ -135,9 +143,18 @@ export function ConfigView() {
           <div className="empty">配置还没读出来。</div>
         ) : (
           <>
-            {CONFIG_SECTIONS.map((section) => (
+            {CONFIG_SECTIONS.map((section) => {
+              // 标题上那句档位说明由字段表推出来（configSpec 是唯一来源）——
+              // 段落里最重的一档决定说哪句；全是热生效就不加任何尾巴。
+              const tier = sectionEffect(section.fields);
+              return (
               <fieldset key={section.title}>
-                <legend>{section.title}</legend>
+                <legend>
+                  {section.title}
+                  {tier !== "hot" ? (
+                    <span className="star"> ★ {EFFECT_HINTS[tier]}</span>
+                  ) : null}
+                </legend>
                 {section.fields.map((field) => (
                   <Field
                     key={field.path}
@@ -180,7 +197,8 @@ export function ConfigView() {
                   />
                 )}
               </fieldset>
-            ))}
+              );
+            })}
           </>
         )}
       </Panel>
@@ -296,7 +314,7 @@ function Field({
   return (
     <div className="field">
       <label htmlFor={id}>
-        {field.star ? <span className="star">★ </span> : null}
+        {effectTier(field.path) !== "hot" ? <span className="star">★ </span> : null}
         {field.label}
       </label>
       <div>{input}</div>

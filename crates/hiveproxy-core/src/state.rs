@@ -100,6 +100,12 @@ pub struct HiveState {
     pub zones: RwLock<crate::zone::ZoneTable>,
     /// SOCKS5 实际绑定的地址（配 `:0` 时由系统分配，UI 与测试需要知道真实端口）。
     pub proxy_bound: RwLock<Option<std::net::SocketAddr>>,
+    /// 入向端口**实际**绑上的地址，由 `listener` 在 bind 成功后写入。
+    ///
+    /// 为什么不能直接读 `node.listen`：那是 `NodeIdentity` 里的启动快照，而身份是 `Arc`、
+    /// 全引擎按不可变在用。配置改端口后引擎会**原地重绑**（不重建），只更新身份是做不到的 ——
+    /// 没有这一份的话，`status().listen` 会一直显示老端口，属于"静默失效"那一类。
+    pub listen_bound: RwLock<Vec<std::net::SocketAddr>>,
     /// 是否探测到身份冲突（§6.3）。
     pub identity_conflict: AtomicBool,
     /// 规则表版本，用于 `hive://rules` 去抖。
@@ -136,6 +142,7 @@ impl HiveState {
             started_at: Instant::now(),
             zones: RwLock::new(crate::zone::ZoneTable::default()),
             proxy_bound: RwLock::new(None),
+            listen_bound: RwLock::new(Vec::new()),
             identity_conflict: AtomicBool::new(false),
             rules_version: AtomicU64::new(1),
         });
@@ -149,6 +156,44 @@ impl HiveState {
 
     pub fn self_id(&self) -> NodeId {
         self.node.node_id
+    }
+
+    /// 当前**实际**在听的地址。
+    ///
+    /// 优先用 `listener` 绑出来的那份；还没绑上（启动瞬间、或全部端口都绑失败）时退回身份里
+    /// 的初始猜测。所有"对外说我在哪儿"的地方都必须走这里，不能直接读 `node.listen`。
+    pub fn listen_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let bound = self.listen_bound.read().clone();
+        if bound.is_empty() {
+            self.node.listen.clone()
+        } else {
+            bound
+        }
+    }
+
+    /// 当前实际监听的端口（`HelloAck.listen_ports` 的对齐自检、mDNS 广播都用它）。
+    pub fn listen_ports_live(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self.listen_addrs().iter().map(|a| a.port()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// 生成本节点的 `ListenAdvert`（§6.5）。
+    ///
+    /// 与 `NodeIdentity::listen_advert` 的唯一区别：用**实际绑上的**地址。
+    /// 端口改过之后，广播给别人的必须是真的在听的那个，否则对端会一直往一个已经关掉的孔洞拨。
+    pub fn listen_advert(
+        &self,
+        advertise: bool,
+        now_unix: u64,
+        ttl_secs: u32,
+    ) -> crate::proto::ListenAdvert {
+        crate::proto::ListenAdvert {
+            addrs: if advertise { self.listen_addrs() } else { Vec::new() },
+            issued_at: now_unix,
+            ttl_secs,
+        }
     }
 
     pub fn alloc_stream_id(&self) -> u64 {

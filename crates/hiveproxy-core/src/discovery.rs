@@ -77,7 +77,7 @@ pub fn spawn_discovery(state: Arc<HiveState>, cancel: CancellationToken) {
                     let probe = Probe {
                         magic: MAGIC,
                         node_addr: state.self_id(),
-                        listen_ports: state.node.listen_ports(),
+                        listen_ports: state.listen_ports_live(),
                         alias: state.node.alias.clone(),
                     };
                     let Ok(bytes) = serde_json::to_vec(&probe) else { continue };

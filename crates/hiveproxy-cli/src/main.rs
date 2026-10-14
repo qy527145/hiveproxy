@@ -1,13 +1,16 @@
 //! hiveproxy 的无界面命令行版本。
 //!
-//! 面向**没有图形界面的 Linux 服务器 / 容器 / systemd**。所有能力与 GUI 一致，
-//! 只是入口换成了命令行 + 配置文件 + 一个本地管理 socket（§20）。
+//! 面向**没有图形界面的 Linux 服务器 / 容器 / systemd**。所有能力与 GUI 一致：
+//! 命令行 + 一个本地管理 socket（§20）+ 一个 **web 界面**（docs/WEBUI.md）。
 //!
 //! ```text
-//! hiveproxy-cli init                     生成配置模板
-//! hiveproxy-cli check                    只校验配置，不启动
-//! hiveproxy-cli run                      前台运行（适合 systemd）
+//! hiveproxy-cli run                      前台运行；引擎 + web 界面都起来（适合 systemd）
 //! hiveproxy-cli run --status-interval 30 运行并周期打印状态
+//! hiveproxy-cli run --no-web             只跑引擎
+//! hiveproxy-cli web-token                看访问令牌状态
+//! hiveproxy-cli web-token --reset        生成新的一次性令牌（忘了令牌时的出路）
+//! hiveproxy-cli check                    只校验配置，不启动
+//! hiveproxy-cli init                     生成配置模板（`run` 现在会自己生成，一般用不到）
 //! hiveproxy-cli status | nodes | rules | streams | zones
 //! hiveproxy-cli probe 10.4.0.9:3389
 //! hiveproxy-cli probe-exits 10.4.0.9:3389 候选出口清单
@@ -19,15 +22,22 @@
 //! hiveproxy-cli seed-add 10.1.2.3:20000
 //! ```
 //!
-//! 这些子命令都是在**跟正在运行的节点说话**（通过本地管理 socket），
+//! ★ **`run` 不需要预先准备配置文件**：没有就写一份默认的（与桌面端同一条路径）。
+//! 所有配置都能在 web 界面上改 —— 改端口会**原地重绑**，改身份才会重建引擎，
+//! 而重建期间 web 界面不断线（docs/WEBUI.md §5）。
+//!
+//! 那几个查询子命令是在**跟正在运行的节点说话**（通过本地管理 socket），
 //! 所以不需要重启，也不需要额外的守护进程。
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use hiveproxy_core::config::Config;
 use hiveproxy_core::node::HiveNode;
+use hiveproxy_core::service::ServiceHandle;
+use hiveproxy_core::web;
 
 /// 退出码：0 正常 / 1 用法错 / 2 配置错 / 3 连接不上运行中的节点
 const EXIT_USAGE: u8 = 1;
@@ -53,6 +63,12 @@ struct Opts {
     status_interval: u64,
     json: bool,
     force: bool,
+    /// `run` 时不启动 web 界面（回到"只有管理 socket"的老样子）。
+    no_web: bool,
+    /// 只覆盖**这一次**的 web 监听地址，不写回配置。
+    web_bind: Option<SocketAddr>,
+    /// 开发用：界面从磁盘读，改完前端刷新浏览器即可。
+    web_assets: Option<PathBuf>,
     args: Vec<String>,
 }
 
@@ -63,6 +79,9 @@ fn parse_args(argv: &[String]) -> Result<Opts, String> {
     let mut status_interval: u64 = 0;
     let mut json = false;
     let mut force = false;
+    let mut no_web = false;
+    let mut web_bind: Option<SocketAddr> = None;
+    let mut web_assets: Option<PathBuf> = None;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = argv.iter().peekable();
@@ -78,6 +97,14 @@ fn parse_args(argv: &[String]) -> Result<Opts, String> {
                 let v = it.next().ok_or("--status-interval 后面要跟秒数")?;
                 status_interval = v.parse().map_err(|_| format!("无效秒数 `{v}`"))?;
             }
+            "--web-bind" => {
+                let v = it.next().ok_or("--web-bind 后面要跟地址，如 127.0.0.1:10801")?;
+                web_bind = Some(v.parse().map_err(|_| format!("无效地址 `{v}`"))?);
+            }
+            "--web-assets" => {
+                web_assets = Some(PathBuf::from(it.next().ok_or("--web-assets 后面要跟目录")?));
+            }
+            "--no-web" => no_web = true,
             "--json" => json = true,
             "-f" | "--force" => force = true,
             "-h" | "--help" => {
@@ -103,7 +130,18 @@ fn parse_args(argv: &[String]) -> Result<Opts, String> {
     }
 
     let config = config.unwrap_or_else(|| PathBuf::from("hiveproxy.toml"));
-    Ok(Opts { command, config, data_dir, status_interval, json, force, args: rest })
+    Ok(Opts {
+        command,
+        config,
+        data_dir,
+        status_interval,
+        json,
+        force,
+        no_web,
+        web_bind,
+        web_assets,
+        args: rest,
+    })
 }
 
 /// 配置所在目录就是数据目录（除非显式指定）。
@@ -118,12 +156,14 @@ fn base_dir(o: &Opts) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// 读配置。**文件不存在时返回默认值，不再报错。**
+///
+/// 这是"启动不需要准备配置文件"落在 CLI 上的样子：`run` 自己会写一份（`ServiceHandle::start`
+/// 里的 `load_or_init_config`），查询子命令在没有配置文件时也该说"节点没跑"，
+/// 而不是丢一句"配置文件不存在"让人以为要先 init。
 fn load_config(o: &Opts) -> Result<Config, String> {
     if !o.config.exists() {
-        return Err(format!(
-            "配置文件 {} 不存在。先跑 `hiveproxy-cli init` 生成一份模板。",
-            o.config.display()
-        ));
+        return Ok(Config::default());
     }
     let text = std::fs::read_to_string(&o.config).map_err(|e| format!("读配置失败：{e}"))?;
     Config::from_toml(&text).map_err(|e| format!("配置解析失败：{e}"))
@@ -150,6 +190,7 @@ async fn run(argv: Vec<String>) -> u8 {
         "init" => cmd_init(&o),
         "check" => cmd_check(&o),
         "run" => cmd_run(&o).await,
+        "web-token" => cmd_web_token(&o),
         // 其余都是在跟运行中的节点说话
         _ => cmd_query(&o).await,
     }
@@ -163,18 +204,22 @@ fn print_help() {
   hiveproxy-cli [选项] <命令> [参数]
 
 选项：
-  -c, --config <路径>        配置文件（默认 ./hiveproxy.toml）
+  -c, --config <路径>        配置文件（默认 ./hiveproxy.toml；**不存在会自动生成**）
   -d, --data-dir <路径>      数据目录（默认取配置文件所在目录）
   -i, --status-interval <秒> run 时周期性打印状态；0 = 不打印（默认）
+      --web-bind <地址>      run 时覆盖 web 监听地址（只这一次，不写回配置）
+      --web-assets <目录>    界面从磁盘读（开发用：改完前端刷新浏览器即可）
+      --no-web               run 时不启动 web 界面
       --json                 输出 JSON（便于脚本处理）
-  -f, --force                init 时覆盖已存在的配置
+  -f, --force                init 时覆盖已存在的配置；web-token 时重置令牌
   -h, --help                 本帮助
   -V, --version              版本号
 
 命令：
-  init                       生成配置模板并退出
+  init                       生成配置模板并退出（`run` 会自己生成，一般用不到）
   check                      只校验配置，不启动
-  run                        前台运行（适合 systemd / 容器）
+  run                        前台运行（适合 systemd / 容器）；引擎 + web 界面都起来
+  web-token                  看访问令牌状态；--reset 生成新的一次性令牌
 
   以下命令通过本地管理 socket 与**正在运行的节点**对话（无需重启）：
   status                     状态摘要
@@ -194,10 +239,13 @@ fn print_help() {
   seed-add / seed-del <地址>  增删引导种子
 
 快速开始：
-  hiveproxy-cli init
-  vi hiveproxy.toml          # 至少改 [listen] ports 与 [peers] seeds
+  hiveproxy-cli run          # 引擎与 web 界面一起起来，配置在 web 界面上改
+  # 打开它打印出来的地址，用那串一次性令牌登录
+
+  也可以仍旧走命令行：
+  hiveproxy-cli init && vi hiveproxy.toml   # 至少改 [listen] ports 与 [peers] seeds
   hiveproxy-cli check
-  hiveproxy-cli run
+  hiveproxy-cli run --no-web
 "#,
         ver = hiveproxy_core::VERSION
     );
@@ -245,7 +293,13 @@ fn cmd_check(o: &Opts) -> u8 {
         }
     };
     let warns = cfg.validate();
-    println!("✓ 配置可解析：{}", o.config.display());
+    if o.config.exists() {
+        println!("✓ 配置可解析：{}", o.config.display());
+    } else {
+        // 不再让人先去 init：`run` 会自己写一份，所以这里只是告诉他现在校验的是默认值
+        println!("✓ 没有配置文件（{}），校验的是默认值", o.config.display());
+        println!("  `hiveproxy-cli run` 会自动生成一份，之后在 web 界面上改即可。");
+    }
     println!("  数据目录：{}", base_dir(o).display());
     println!("  身份：{}", cfg.node.overlay_addr.map(|a| a.to_string()).unwrap_or_else(|| "（自动取本机主网卡地址）".into()));
     println!("  监听：{} × {:?}", cfg.listen.bind, cfg.listen.ports);
@@ -268,6 +322,9 @@ fn cmd_check(o: &Opts) -> u8 {
 }
 
 async fn cmd_run(o: &Opts) -> u8 {
+    let dir = base_dir(o);
+
+    // 日志级别要从配置里取，所以先读（**读不到就给默认值**，不再要求先 init）
     let cfg = match load_config(o) {
         Ok(c) => c,
         Err(e) => {
@@ -275,7 +332,6 @@ async fn cmd_run(o: &Opts) -> u8 {
             return EXIT_CONFIG;
         }
     };
-    let dir = base_dir(o);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -285,31 +341,89 @@ async fn cmd_run(o: &Opts) -> u8 {
         .with_target(true)
         .init();
 
-    // 配置自检只告警，不阻断启动
-    for w in cfg.validate() {
+    // ★ 自检的是**这一次实际生效**的配置：`--web-bind` / `--no-web` 是只作用于本次运行的
+    // 覆盖，不参与校验的话会出现"我明明指了回环，它还在警告监听局域网"这种自相矛盾的日志。
+    let mut effective = cfg.clone();
+    if let Some(b) = o.web_bind {
+        effective.web.bind = b;
+    }
+    if o.no_web {
+        effective.web.enabled = false;
+    }
+    for w in effective.validate() {
         tracing::warn!("配置告警：{w}");
     }
 
-    let node = match HiveNode::start(cfg, &dir).await {
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("✗ 启动失败：{e}");
-            return EXIT_CONFIG;
-        }
+    let handle = ServiceHandle::new(&dir);
+    let engine_err = match handle.start().await {
+        Ok(_) => None,
+        Err(e) => Some(e),
     };
 
     eprintln!();
-    eprintln!("hiveproxy {} 已在数据目录 {} 启动", hiveproxy_core::VERSION, dir.display());
-    if let Some(ep) = node.admin_endpoint() {
-        eprintln!("管理接口：{ep}");
-        eprintln!("          例如 `hiveproxy-cli status`，或 `echo status | nc -U {}`", ep.trim_start_matches("unix "));
+    match &engine_err {
+        None => eprintln!(
+            "hiveproxy {} 已在数据目录 {} 启动",
+            hiveproxy_core::VERSION,
+            dir.display()
+        ),
+        Some(e) => {
+            // ★ **引擎起不来不等于进程要退出**（这是"web 与引擎分开控制"的全部意义）：web 界面必须还能打开，
+            // 否则无界面机器上就只能回到终端改配置了（这正是拆开两者的理由）。
+            eprintln!("✗ 引擎启动失败：{e}");
+            eprintln!("  web 界面仍会启动（如果没被 --no-web 关掉）—— 打开它改配置，然后点「重启引擎」。");
+        }
+    }
+
+    // `--web-bind` / `--no-web` 只覆盖这一次，**不写回配置**（`effective` 就是那份覆盖过的副本）
+    let web_cfg = effective.clone();
+
+    let web_handle = if o.no_web || !web_cfg.web.enabled {
+        if o.no_web {
+            eprintln!("web 界面：已用 --no-web 关闭");
+        } else {
+            eprintln!("web 界面：配置里 web.enabled = false");
+        }
+        None
+    } else {
+        match web::spawn(handle.clone(), &web_cfg, o.web_assets.clone()).await {
+            Ok(w) => {
+                print_web_banner(&w, &web_cfg);
+                Some(w)
+            }
+            Err(e) => {
+                eprintln!("✗ web 界面启动失败：{e}");
+                None
+            }
+        }
+    };
+
+    // 引擎和 web 都没起来 → 没什么可等的，按配置错退出
+    if engine_err.is_some() && web_handle.is_none() {
+        if let Some(ep) = handle.peek().and_then(|n| n.admin_endpoint()) {
+            eprintln!("管理接口：{ep}");
+        }
+        return EXIT_CONFIG;
+    }
+
+    if let Some(node) = handle.peek() {
+        if let Some(ep) = node.admin_endpoint() {
+            eprintln!("管理接口：{ep}");
+            eprintln!(
+                "          例如 `hiveproxy-cli status`，或 `echo status | nc -U {}`",
+                ep.trim_start_matches("unix ")
+            );
+        }
     }
     eprintln!("按 Ctrl-C 退出。");
     eprintln!();
 
     // 可选：周期性打印一行状态（便于 systemd journal / docker logs 里看）
+    //
+    // ★ 这一行从 `ServiceHandle` 现取节点，不是启动时那个 —— 引擎可能已经被
+    // 一次配置改动重建过了，攥着老的 `Arc` 只会一直打印陈旧的统计。
     if o.status_interval > 0 {
-        let n = node.clone();
+        let h = handle.clone();
         let secs = o.status_interval;
         let json = o.json;
         tokio::spawn(async move {
@@ -318,6 +432,7 @@ async fn cmd_run(o: &Opts) -> u8 {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                let Some(n) = h.peek() else { continue };
                 let st = n.status();
                 let s = n.stats();
                 if json {
@@ -358,8 +473,83 @@ async fn cmd_run(o: &Opts) -> u8 {
     // 等退出信号
     wait_for_shutdown().await;
     eprintln!("正在退出…");
-    node.stop().await;
+    // 先关 web 再停引擎：反过来的话，浏览器在引擎停掉那一刻会连着看到一串错误
+    if let Some(w) = web_handle {
+        w.stop();
+    }
+    handle.stop().await;
     0
+}
+
+/// 打印 web 界面的地址与**一次性令牌**（docs/WEBUI.md §6.2）。
+fn print_web_banner(w: &web::WebHandle, cfg: &Config) {
+    let urls = w.urls();
+    let mut out = String::new();
+    out.push_str("┌─ hiveproxy web 界面 ─────────────────────────────────────────\n");
+    for (i, u) in urls.iter().enumerate() {
+        out.push_str(&format!("│  {}  {u}\n", if i == 0 { "地址" } else { "    " }));
+    }
+    match &w.initial_token {
+        Some(t) => {
+            out.push_str(&format!("│  令牌   {t}\n"));
+            out.push_str("│         ↑ 首次登录用，进去之后会被要求改掉（之后不再打印）\n");
+        }
+        None => {
+            out.push_str("│  令牌   已改过（忘了就用 `hiveproxy-cli web-token --reset`）\n");
+        }
+    }
+    if !cfg.web.bind.ip().is_loopback() {
+        out.push_str("│  ⚠ 明文 HTTP：令牌与全部数据在网段里是明文。更安全的两种用法：\n");
+        out.push_str(&format!(
+            "│    · SSH 隧道：ssh -L {p}:127.0.0.1:{p} 用户@这台机器（并把 web.bind 改回环）\n",
+            p = cfg.web.bind.port()
+        ));
+        out.push_str("│    · 前面放一个带 TLS 的反向代理\n");
+    }
+    out.push_str("└──────────────────────────────────────────────────────────────");
+    eprintln!("{out}");
+}
+
+/// `web-token`：看状态或重置。
+fn cmd_web_token(o: &Opts) -> u8 {
+    let dir = base_dir(o);
+    if o.force {
+        match web::reset_token(&dir) {
+            Ok(t) => {
+                println!("已生成新的一次性令牌（旧令牌与会话全部作废）：");
+                println!("  {t}");
+                println!("用它在浏览器里登录，进去后会被要求改掉。");
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                EXIT_CONFIG
+            }
+        }
+    } else {
+        match web::token_status(&dir) {
+            Ok(s) if !s.initialized => {
+                println!("还没有令牌文件（数据目录 {}）—— 跑一次 `hiveproxy-cli run` 就会生成。", dir.display());
+                0
+            }
+            Ok(s) => {
+                println!(
+                    "令牌状态：{}",
+                    if s.must_change { "仍是首次生成的那个（登录后会被要求改掉）" } else { "已由用户改过" }
+                );
+                match s.changed_at {
+                    Some(t) => println!("上次更换：{t}（unix 秒）"),
+                    None => println!("从未更换过"),
+                }
+                println!("忘了令牌：`hiveproxy-cli web-token --reset`");
+                0
+            }
+            Err(e) => {
+                eprintln!("✗ {e}");
+                EXIT_CONFIG
+            }
+        }
+    }
 }
 
 async fn wait_for_shutdown() {
@@ -616,6 +806,9 @@ mod tests {
             status_interval: 0,
             json: false,
             force: false,
+            no_web: false,
+            web_bind: None,
+            web_assets: None,
             args: args.iter().map(|s| s.to_string()).collect(),
         }
     }

@@ -1,22 +1,25 @@
 //! Tauri v2 外壳。核心引擎全部在 `hiveproxy-core` 里，这里只做三件事：
-//! 1. 管理服务的启停（GUI 上要有开关）；
+//! 1. 把引擎的生命周期交给 `ServiceHandle`（与 web 界面共用同一份实现）；
 //! 2. 把 core 的事件转发成前端事件；
 //! 3. 把 core 的 API 暴露成 Tauri 命令（DESIGN.md §6.7 的命令契约）。
+//!
+//! ★ 从 2026-10-14 起，命令的**函数体全在 `hiveproxy_core::api`**（docs/WEBUI.md §3.1）：
+//! 这里每个命令都只剩一行转发。这么做不是为了好看，是因为 web 界面要跑同一套界面 ——
+//! 两边各写一份薄包装，迟早会漂移成"桌面上能用、web 上点了没反应"。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use hiveproxy_core::api;
 use hiveproxy_core::config::Config;
 use hiveproxy_core::node::HiveNode;
-use hiveproxy_core::persist;
 use hiveproxy_core::proto::NodeId;
-use hiveproxy_core::rules::{RawRule, Rule};
+use hiveproxy_core::rules::RawRule;
+use hiveproxy_core::service::ServiceHandle;
 use hiveproxy_core::view::{
     DialResult, ExitCandidate, GroupView, NodeStatus, PublishResult, RuleIssue, RulePreview,
-    RuleStat, RulesView, SharedRulesStatus, StatsSnapshot, StreamProbe, TopologySnapshot,
-    ZoneView2,
+    RuleStat, RulesView, ServiceState, SharedRulesStatus, StatsSnapshot, StreamProbe,
+    TopologySnapshot, ZoneView2,
 };
-use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
 /// 前端只订阅一个事件名 `hive`，载荷里带 `event` 字段区分类型。
@@ -25,116 +28,13 @@ const EVENT_NAME: &str = "hive";
 /// 供事件转发器拿到 AppHandle（在 setup 里写入）。
 static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
 
-struct Inner {
-    node: Option<Arc<HiveNode>>,
-    base_dir: PathBuf,
-    /// 上次启动失败的原因，供 UI 显示（而不是静默白屏）。
-    last_error: Option<String>,
-}
-
 struct AppState {
-    inner: parking_lot::Mutex<Inner>,
+    handle: Arc<ServiceHandle>,
 }
 
-impl AppState {
-    fn node(&self) -> Result<Arc<HiveNode>, String> {
-        let g = self.inner.lock();
-        g.node
-            .clone()
-            .ok_or_else(|| g.last_error.clone().unwrap_or_else(|| "服务未运行".to_string()))
-    }
-
-    fn base_dir(&self) -> PathBuf {
-        self.inner.lock().base_dir.clone()
-    }
-}
-
-/// 服务状态快照。
-#[derive(Serialize, Clone)]
-struct ServiceState {
-    running: bool,
-    autostart: bool,
-    node_id: String,
-    proxy_bind: String,
-    admin_endpoint: Option<String>,
-    data_dir: String,
-    last_error: Option<String>,
-}
-
-#[tauri::command]
-fn service_state(state: State<'_, AppState>) -> ServiceState {
-    let base_dir = state.base_dir();
-    let cfg = persist::load_config(&base_dir).unwrap_or_default();
-    let g = state.inner.lock();
-
-    let (node_id, socks5) = match &g.node {
-        Some(n) => {
-            let st = n.status();
-            (st.node_id.to_string(), st.proxy_bind)
-        }
-        None => {
-            // 未运行时也要能显示"我是谁、代理挂哪儿"，所以从配置/网卡现算
-            let id = cfg
-                .node
-                .overlay_addr
-                .map(|a| a.to_string())
-                .or_else(|| hiveproxy_core::net::primary_ip().map(|a| a.to_string()))
-                .unwrap_or_else(|| "—".into());
-            (id, cfg.proxy.bind.to_string())
-        }
-    };
-
-    ServiceState {
-        running: g.node.is_some(),
-        autostart: cfg.service.autostart,
-        node_id,
-        proxy_bind: socks5,
-        admin_endpoint: g.node.as_ref().and_then(|n| n.admin_endpoint()),
-        data_dir: persist::data_dir(&base_dir).to_string_lossy().to_string(),
-        last_error: g.last_error.clone(),
-    }
-}
-
-/// 启动服务。已经在跑时是空操作。
-#[tauri::command]
-async fn service_start(state: State<'_, AppState>) -> Result<ServiceState, String> {
-    let base_dir = state.base_dir();
-    if state.inner.lock().node.is_some() {
-        return Ok(service_state(state));
-    }
-
-    let cfg = persist::load_or_init_config(&base_dir).map_err(|e| e.to_string())?;
-    match HiveNode::start(cfg, &base_dir).await {
-        Ok(node) => {
-            let endpoint = node.admin_endpoint();
-            spawn_forwarder(node.clone());
-            {
-                let mut g = state.inner.lock();
-                g.node = Some(node);
-                g.last_error = None;
-            }
-            tracing::info!("服务已启动（管理接口：{endpoint:?}）");
-            Ok(service_state(state))
-        }
-        Err(e) => {
-            state.inner.lock().last_error = Some(e.clone());
-            tracing::error!("服务启动失败：{e}");
-            Err(e)
-        }
-    }
-}
-
-#[tauri::command]
-async fn service_stop(state: State<'_, AppState>) -> Result<ServiceState, String> {
-    let node = state.inner.lock().node.take();
-    if let Some(n) = node {
-        n.stop().await;
-        tracing::info!("服务已停止");
-    }
-    Ok(service_state(state))
-}
-
-/// 把 core 的事件转发给前端。每次启动服务都挂一个新的。
+/// 把 core 的事件转发给前端。**每次引擎启动都会挂一个新的** ——
+/// 包括配置改动导致的原地重建（§5.3），所以它走的是 `ServiceHandle::on_start` 钩子，
+/// 而不是在 `service_start` 里手工挂一次（那样重建之后界面就再也收不到事件了）。
 fn spawn_forwarder(node: Arc<HiveNode>) {
     let Some(app) = APP_HANDLE.get() else { return };
     let handle = app.clone();
@@ -157,26 +57,36 @@ fn spawn_forwarder(node: Arc<HiveNode>) {
                         }),
                     );
                 }
-                // 服务被停掉后通道关闭 —— 正常退出，不刷错误
+                // 引擎被停掉/重建后通道关闭 —— 正常退出，不刷错误
                 Err(_) => break,
             }
         }
     });
 }
 
+// ---------------------------------------------------------------------------
+// 服务生命周期
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+fn service_state(state: State<'_, AppState>) -> ServiceState {
+    api::service_state(&state.handle)
+}
+
+#[tauri::command]
+async fn service_start(state: State<'_, AppState>) -> Result<ServiceState, String> {
+    api::service_start(&state.handle).await
+}
+
+#[tauri::command]
+async fn service_stop(state: State<'_, AppState>) -> Result<ServiceState, String> {
+    api::service_stop(&state.handle).await
+}
+
 /// 前端日志回传：让浏览器侧的报错也进引擎日志（排障时非常有用）。
 #[tauri::command]
 fn ui_log(state: State<'_, AppState>, level: String, msg: String) {
-    let node = state.inner.lock().node.clone();
-    match node {
-        Some(n) => n.state.log(&level, "ui", msg),
-        None => match level.as_str() {
-            "error" => tracing::error!(target: "hiveproxy", "ui: {msg}"),
-            "warn" => tracing::warn!(target: "hiveproxy", "ui: {msg}"),
-            "debug" => tracing::debug!(target: "hiveproxy", "ui: {msg}"),
-            _ => tracing::info!(target: "hiveproxy", "ui: {msg}"),
-        },
-    }
+    api::ui_log(&state.handle, &level, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,66 +95,47 @@ fn ui_log(state: State<'_, AppState>, level: String, msg: String) {
 
 #[tauri::command]
 fn status(state: State<'_, AppState>) -> Result<NodeStatus, String> {
-    Ok(state.node()?.status())
+    api::status(&state.handle)
 }
 
 #[tauri::command]
 fn topology(state: State<'_, AppState>) -> Result<TopologySnapshot, String> {
-    Ok(state.node()?.topology())
+    api::topology(&state.handle)
 }
 
 #[tauri::command]
 fn stats(state: State<'_, AppState>) -> Result<StatsSnapshot, String> {
-    Ok(state.node()?.stats())
+    api::stats(&state.handle)
 }
 
-/// 服务没跑时也要能编辑配置，所以这一条直接读磁盘。
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<Config, String> {
-    persist::load_config(&state.base_dir()).map_err(|e| e.to_string())
+    api::get_config(&state.handle)
 }
 
 #[tauri::command]
-fn set_config(state: State<'_, AppState>, cfg: Config) -> Result<(), String> {
-    match state.inner.lock().node.clone() {
-        Some(n) => n.set_config(cfg),
-        // 未运行时只落盘，下次启动生效
-        None => persist::save_config(&state.base_dir(), &cfg).map_err(|e| e.to_string()),
-    }
+async fn set_config(state: State<'_, AppState>, cfg: Config) -> Result<(), String> {
+    api::set_config(&state.handle, cfg).await
 }
 
 #[tauri::command]
 fn get_rules(state: State<'_, AppState>) -> Result<RulesView, String> {
-    Ok(state.node()?.rules_view())
-}
-
-/// 原始行（前端草稿的形态）→ 规则表，**逐行报错**。
-///
-/// 这一层以前收的是 `Vec<Rule>`：任何一行解析失败都是整份反序列化失败，
-/// 前端拿到的只有 `invalid args \`rules\` for command \`set_rules\`: …` ——
-/// 看不出是哪一行、也看不出该怎么改（§18 第 32 条）。
-fn parse_rows(rules: Vec<RawRule>) -> Result<Vec<Rule>, String> {
-    rules
-        .into_iter()
-        .enumerate()
-        .map(|(i, raw)| Rule::try_from(raw).map_err(|e| format!("第 {} 条：{e}", i + 1)))
-        .collect()
+    api::get_rules(&state.handle)
 }
 
 #[tauri::command]
 fn set_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<(), String> {
-    state.node()?.set_local_rules(parse_rows(rules)?)
+    api::set_rules(&state.handle, rules)
 }
 
-/// 逐行校验（行内红字的来源）。不收 `Vec<Rule>` 是因为那样一失败就整份没了。
 #[tauri::command]
 fn check_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<Vec<RuleIssue>, String> {
-    Ok(state.node()?.check_rules(rules))
+    api::check_rules(&state.handle, rules)
 }
 
 #[tauri::command]
 fn preview_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<RulePreview, String> {
-    Ok(state.node()?.preview_rules(parse_rows(rules)?))
+    api::preview_rules(&state.handle, rules)
 }
 
 #[tauri::command]
@@ -252,79 +143,62 @@ async fn publish_rules(
     state: State<'_, AppState>,
     rules: Vec<RawRule>,
 ) -> Result<PublishResult, String> {
-    state.node()?.publish_rules(parse_rows(rules)?).await
+    api::publish_rules(&state.handle, rules).await
 }
 
 #[tauri::command]
 async fn revoke_shared_rules(state: State<'_, AppState>) -> Result<PublishResult, String> {
-    state.node()?.revoke_shared_rules().await
+    api::revoke_shared_rules(&state.handle).await
 }
 
 #[tauri::command]
 fn set_rules_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    state.node()?.set_rules_enabled(enabled)
+    api::set_rules_enabled(&state.handle, enabled)
 }
 
 #[tauri::command]
 fn sort_rules(state: State<'_, AppState>, rules: Vec<RawRule>) -> Result<Vec<RawRule>, String> {
-    let sorted = state.node()?.sort_rules(parse_rows(rules)?);
-    Ok(sorted.into_iter().map(RawRule::from).collect())
+    api::sort_rules(&state.handle, rules)
 }
 
 #[tauri::command]
 fn rule_stats(state: State<'_, AppState>) -> Result<Vec<RuleStat>, String> {
-    Ok(state.node()?.rule_stats())
+    api::rule_stats(&state.handle)
 }
 
 #[tauri::command]
 fn shared_rules_status(state: State<'_, AppState>) -> Result<SharedRulesStatus, String> {
-    Ok(state.node()?.shared_rules_status())
+    api::shared_rules_status(&state.handle)
 }
 
 #[tauri::command]
 fn groups(state: State<'_, AppState>) -> Result<Vec<GroupView>, String> {
-    Ok(state.node()?.groups())
+    api::groups(&state.handle)
 }
 
 #[tauri::command]
 fn zones(state: State<'_, AppState>) -> Result<Vec<ZoneView2>, String> {
-    Ok(state.node()?.zones())
+    api::zones(&state.handle)
 }
 
 #[tauri::command]
 fn add_seed(state: State<'_, AppState>, addr: String) -> Result<(), String> {
-    state.node()?.add_seed(addr)
+    api::add_seed(&state.handle, addr)
 }
 
 #[tauri::command]
 fn remove_seed(state: State<'_, AppState>, addr: String) -> Result<(), String> {
-    state.node()?.remove_seed(addr)
+    api::remove_seed(&state.handle, addr)
 }
 
 #[tauri::command]
 fn ping_peer(state: State<'_, AppState>, peer: NodeId) -> Result<u32, String> {
-    state.node()?.ping_peer(peer)
-}
-
-#[derive(Serialize)]
-struct StreamRow {
-    peer: String,
-    stream_id: u64,
-    target: String,
+    api::ping_peer(&state.handle, peer)
 }
 
 #[tauri::command]
-fn active_streams(state: State<'_, AppState>) -> Result<Vec<StreamRow>, String> {
-    Ok(state
-        .node()?
-        .active_streams()
-        .into_iter()
-        .map(|(peer, id, target)| StreamRow {
-            peer: peer.to_string(),
-            stream_id: id,
-            target,
-        })
-        .collect())
+fn active_streams(state: State<'_, AppState>) -> Result<Vec<api::StreamRow>, String> {
+    api::active_streams(&state.handle)
 }
 
 #[tauri::command]
@@ -333,50 +207,46 @@ async fn close_stream(
     peer: NodeId,
     stream_id: u64,
 ) -> Result<(), String> {
-    state.node()?.close_stream(peer, stream_id).await
+    api::close_stream(&state.handle, peer, stream_id).await
 }
 
 #[tauri::command]
 async fn probe_target(state: State<'_, AppState>, target: String) -> Result<StreamProbe, String> {
-    state.node()?.probe_target(&target).await
+    api::probe_target(&state.handle, target).await
 }
 
-/// 候选出口清单（§18 第 31 条）：纯路由计算，不建流。
 #[tauri::command]
 fn probe_exits(state: State<'_, AppState>, target: String) -> Result<Vec<ExitCandidate>, String> {
-    state.node()?.probe_exits(&target)
+    api::probe_exits(&state.handle, target)
 }
 
-/// 实测：让某个出口真的连一次目标再关掉（会产生一次真实连接）。
 #[tauri::command]
 async fn probe_dial(
     state: State<'_, AppState>,
     target: String,
     via: NodeId,
 ) -> Result<DialResult, String> {
-    state.node()?.probe_dial(&target, via).await
+    api::probe_dial(&state.handle, target, via).await
 }
 
 #[tauri::command]
 fn data_dir(state: State<'_, AppState>) -> String {
-    persist::data_dir(&state.base_dir()).to_string_lossy().to_string()
+    api::data_dir(&state.handle)
 }
 
 #[tauri::command]
 fn validate_config(_state: State<'_, AppState>, cfg: Config) -> Vec<String> {
-    cfg.validate()
+    api::validate_config(&cfg)
 }
 
 #[tauri::command]
 fn config_to_toml(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(persist::load_config(&state.base_dir())
-        .map_err(|e| e.to_string())?
-        .to_toml())
+    api::config_to_toml(&state.handle)
 }
 
 #[tauri::command]
 fn config_from_toml(_state: State<'_, AppState>, text: String) -> Result<Config, String> {
-    Config::from_toml(&text).map_err(|e| format!("TOML 解析失败：{e}"))
+    api::config_from_toml(&text)
 }
 
 pub fn run() {
@@ -393,28 +263,25 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data"));
-            persist::ensure_dir(&base)?;
+            hiveproxy_core::persist::ensure_dir(&base)?;
             let _ = APP_HANDLE.set(app.handle().clone());
 
-            let cfg = persist::load_or_init_config(&base).unwrap_or_default();
-            let autostart = cfg.service.autostart;
+            let handle = ServiceHandle::new(base);
+            // ★ 事件转发挂在钩子上，不是每次 start 手工挂 —— 引擎原地重建之后
+            // 旧通道关闭、旧转发器退出，只有钩子能保证新引擎也有人听（§5.3）
+            handle.on_start(spawn_forwarder);
 
-            app.manage(AppState {
-                inner: parking_lot::Mutex::new(Inner {
-                    node: None,
-                    base_dir: base.clone(),
-                    last_error: None,
-                }),
-            });
+            let autostart = handle.current_config().service.autostart;
+            app.manage(AppState { handle: handle.clone() });
 
             if autostart {
-                let handle = app.handle().clone();
+                let handle = handle.clone();
+                let app2 = app.handle().clone();
                 // 启动引擎涉及 tokio 任务与绑定端口，放到异步里做，别卡住窗口
                 tauri::async_runtime::spawn(async move {
-                    let st = handle.state::<AppState>();
-                    if let Err(e) = service_start(st).await {
+                    if let Err(e) = handle.start().await {
                         tracing::error!("自动启动失败：{e}");
-                        let _ = handle.emit(
+                        let _ = app2.emit(
                             EVENT_NAME,
                             serde_json::json!({
                                 "event": "log", "ts_ms": 0, "level": "error",
