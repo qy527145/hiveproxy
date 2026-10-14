@@ -50,6 +50,34 @@ pub struct Topology {
     pub self_id: NodeId,
     /// 本机共享的网段（供 `digest` 与自检使用）。
     pub self_subnets: Vec<IpNet>,
+    /// 本机世代号的起点。
+    ///
+    /// ★ 用**启动时刻**而不是 1：`incarnation` 是"关于同一个 owner 谁更新"的判据，
+    /// 而它只活在内存里 —— 进程重启后从 1 重新开始的话，全网手里那份（比如 5）会一直
+    /// 把我们后面所有的公告判成旧的，于是**我们的邻接边永远更新不进去**
+    /// （别人的拓扑里留着一份我们早就不认的边，路由就会指到不存在的链路上）。
+    /// 用启动时刻起步就天然单调：重启一次只会更大。
+    self_incarnation0: u64,
+    /// 上一次实际广播出去的网段（`share_subnets` 的开关也由它体现）。
+    self_announced: Vec<SubnetAd>,
+}
+
+/// 一次「本机公告」的内容（`set_self` 的入参）。
+///
+/// 为什么要显式区分"索引"与"广播出去的那份"：`share_subnets = false` 只影响**广播**
+/// （"我不告诉别人我的网段"），而本机自己的网段索引必须始终完整 —— 否则这台机器连
+/// 自己所在网段的目标都解析不了（§9.1）。但版本号必须覆盖"实际广播出去的东西"，
+/// 不然翻转 `share_subnets` 时 `seq` 不动，对端会把它当重复公告丢掉，改了配置没人知道。
+#[derive(Clone, Debug, Default)]
+pub struct SelfAnnounce {
+    pub edges: Vec<AdjEntry>,
+    /// 本机**完整**的网段索引（§9.1）。
+    pub subnets_index: Vec<SubnetAd>,
+    /// 这次**广播出去**的网段（`share_subnets = false` 时为空）。
+    pub subnets_announced: Vec<SubnetAd>,
+    pub listen: ListenAdvert,
+    pub accepts_egress: bool,
+    pub alias: Option<String>,
 }
 
 impl Topology {
@@ -63,6 +91,8 @@ impl Topology {
             version: 1,
             self_id,
             self_subnets: Vec::new(),
+            self_incarnation0: crate::events::now_unix().max(1),
+            self_announced: Vec::new(),
         }
     }
 
@@ -72,41 +102,55 @@ impl Topology {
     }
 
     /// 更新**自己**的公告内容。链路上下线、网段变化时调用。
-    pub fn set_self(
-        &mut self,
-        edges: Vec<AdjEntry>,
-        subnets: Vec<SubnetAd>,
-        listen: ListenAdvert,
-        accepts_egress: bool,
-        alias: Option<String>,
-    ) {
-        self.self_subnets = subnets.iter().map(|s| s.net).collect();
+    ///
+    /// ★ `seq` 覆盖的是**被广播出去的每一样东西**（边、网段、监听端点、别名、
+    /// 愿不愿意做出口）：只要其中任何一样变了就 `seq += 1`。早先只在直连边变化时自增，
+    /// 于是"改别名 / 改监听端口 / 关掉网段共享"这些变化广播出去时版本号不变，
+    /// 对端按 `(owner, incarnation, seq)` 去重后整条丢弃 —— 改了配置，邻居永远看不到。
+    ///
+    /// **时间戳不算内容变化**：`issued_at` 每次刷新都会变，把它算进去等于每 5 秒
+    /// 涨一次版本号 + 一次变化驱动 flood。
+    pub fn set_self(&mut self, a: SelfAnnounce) {
+        self.self_subnets = a.subnets_index.iter().map(|s| s.net).collect();
 
-        // 自己也进监听端点表 —— 否则本机网段（SELF 成本 0）在候选集里缺少端点信息。
-        self.listen_addrs.insert(self.self_id, listen);
+        let old_self = self.peers.get(&self.self_id).cloned();
+        let old_listen = self.listen_addrs.get(&self.self_id).map(|l| l.addrs.clone());
+        // 内容变化判定：**不含 rtt**（见 `edges_shape_same`）。
+        let content_changed = !edges_shape_same(
+            self.adjacency.get(&self.self_id).map(|e| e.edges.as_slice()).unwrap_or_default(),
+            &a.edges,
+        ) || !same_subnets(&self.self_announced, &a.subnets_announced)
+            || old_listen.as_deref() != Some(a.listen.addrs.as_slice())
+            || old_self.as_ref().map(|m| m.accepts_egress) != Some(a.accepts_egress)
+            || old_self.as_ref().and_then(|m| m.alias.clone()) != a.alias;
 
+        let incarnation = self.self_incarnation0;
         let entry = self.adjacency.entry(self.self_id).or_insert_with(|| PeerAdj {
-            incarnation: 1,
+            incarnation,
             seq: 0,
             edges: Vec::new(),
             updated_at: Instant::now(),
         });
-        let edges_changed = !same_edges(&entry.edges, &edges);
-        entry.edges = edges;
+        entry.edges = a.edges;
         entry.updated_at = Instant::now();
-        if edges_changed {
+        if content_changed {
             entry.seq += 1;
         }
+        let incarnation = entry.incarnation;
+
+        // 自己也进监听端点表 —— 否则本机网段（SELF 成本 0）在候选集里缺少端点信息。
+        self.listen_addrs.insert(self.self_id, a.listen);
 
         self.peers.insert(
             self.self_id,
             NodeMeta {
-                alias,
-                accepts_egress,
+                alias: a.alias,
+                accepts_egress: a.accepts_egress,
                 last_seen: Instant::now(),
-                incarnation: entry.incarnation,
+                incarnation,
             },
         );
+        self.self_announced = a.subnets_announced;
 
         self.rebuild_segments();
         self.bump();
@@ -138,10 +182,15 @@ impl Topology {
         let mut out = MergeOutcome::default();
 
         // ---- 1. 反驳检查：有人在描述我，且描述不对 ----
+        //
+        // ★ 比较**不含 rtt**（`edges_shape_same`）：这条路径上大概率的来访者是我们
+        // 自己那条广播公告的回环副本，而它携带的是**广播那一刻**的 rtt。rtt 是心跳
+        // 每秒都在量的观测量，把它算作"描述不符"就会触发 `bump_incarnation` + 重播 ——
+        // 一个自我维持的反驳风暴（心跳一上线就会开始）。
         if msg.owner == self.self_id {
             let mine = self.adjacency.get(&self.self_id);
             let disagree = match mine {
-                Some(a) => !same_edges(&a.edges, &msg.edges),
+                Some(a) => !edges_shape_same(&a.edges, &msg.edges),
                 None => !msg.edges.is_empty(),
             };
             if disagree {
@@ -193,10 +242,28 @@ impl Topology {
         }
 
         // ---- 4. 监听端点 ----
-        let old_listen = self.listen_addrs.get(&msg.owner).cloned();
-        if old_listen.as_ref().map(|l| l.addrs != msg.listen.addrs).unwrap_or(true) {
-            self.listen_addrs.insert(msg.owner, msg.listen.clone());
-            out.changed = true;
+        //
+        // ★ 寿命要跟着对端**重新广播**刷新，而不仅是 `addrs` 变了的时候。
+        // 稳定的节点每 5 秒重播一次（内容一样、`issued_at` 是新的），
+        // 早先只在 addrs 不同时才写回，于是存下来的 `issued_at` 一直是第一天那个 ——
+        // 900 秒的 ttl 一过就被 `expire_listen_adverts` 摘掉，对端在拨号器眼里
+        // 变成"不覆盖"的候选，又是一轮重复拨号（每 15 分钟来一次）。
+        match self.listen_addrs.get_mut(&msg.owner) {
+            Some(cur) => {
+                if cur.addrs != msg.listen.addrs {
+                    cur.addrs = msg.listen.addrs.clone();
+                    out.changed = true;
+                }
+                // 刷新寿命不算"变化"：它每 5 秒都会发生一次，算进去等于自造 gossip 风暴。
+                if msg.listen.issued_at >= cur.issued_at {
+                    cur.issued_at = msg.listen.issued_at;
+                    cur.ttl_secs = msg.listen.ttl_secs;
+                }
+            }
+            None => {
+                self.listen_addrs.insert(msg.owner, msg.listen.clone());
+                out.changed = true;
+            }
         }
 
         // ---- 5. 共享规则集：整份 LWW ----
@@ -213,7 +280,17 @@ impl Topology {
         }
 
         // ---- 6. 节点元信息 ----
+        //
+        // ★ 别名 / `accepts_egress` 变了也要算 `changed`：调用方据此决定要不要
+        // `refresh_aliases()`、重算路由与重画拓扑。不算的话，对端改了别名（或关掉了
+        // 出口角色），我们这边的别名表与候选出口会一直停在旧值上 —— 静默失效。
         let incarnation = self.adjacency.get(&msg.owner).map(|a| a.incarnation).unwrap_or(0);
+        let old_meta = self.peers.get(&msg.owner);
+        if old_meta.map(|m| (m.alias.as_deref(), m.accepts_egress))
+            != Some((msg.alias.as_deref(), msg.accepts_egress))
+        {
+            out.changed = true;
+        }
         self.peers.insert(
             msg.owner,
             NodeMeta {
@@ -378,6 +455,38 @@ fn same_edges(a: &[AdjEntry], b: &[AdjEntry]) -> bool {
     x == y
 }
 
+/// 结构性地比较两组边：**不含 `rtt_ms`**。
+///
+/// rtt 是心跳每 3 秒都在量的观测量。凡是"拓扑变没变 / 别人的描述对不对"的判断都必须
+/// 用它，否则：① 每次 rtt 跳一格就等于 `seq += 1` + 一次变化驱动 flood；
+/// ② 回环回来的"我自己那份公告"会因为 rtt 与当前值不同被判成 `self_disputed`，
+/// 触发 `bump_incarnation` + 重播 —— 一个自我维持的反驳风暴。
+/// rtt 只影响下一跳的成本（`router::arc_weight`），不影响图的结构。
+fn edges_shape_same(a: &[AdjEntry], b: &[AdjEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let key = |e: &AdjEntry| (e.peer, e.cost, e.carrier);
+    let mut x: Vec<_> = a.iter().map(key).collect();
+    let mut y: Vec<_> = b.iter().map(key).collect();
+    x.sort();
+    y.sort();
+    x == y
+}
+
+/// 网段声明是否一模一样（网段 + 端口限制，顺序无关）。
+fn same_subnets(a: &[SubnetAd], b: &[SubnetAd]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let key = |s: &SubnetAd| (s.net.to_string(), s.ports.clone());
+    let mut x: Vec<_> = a.iter().map(key).collect();
+    let mut y: Vec<_> = b.iter().map(key).collect();
+    x.sort();
+    y.sort();
+    x == y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +536,7 @@ mod tests {
     fn refutation_detected_when_someone_describes_me_wrongly() {
         let me = nid("10.0.0.1");
         let mut t = Topology::new(me);
-        t.set_self(vec![edge(nid("10.0.0.2"), Carrier::Lan)], vec![], ListenAdvert::default(), true, None);
+        t.set_self(announce(vec![edge(nid("10.0.0.2"), Carrier::Lan)], vec![]));
 
         // 有人声称我和一个我没连的节点相连
         let out = t.merge_gossip(&gossip(me, 99, 1, vec![edge(nid("10.9.9.9"), Carrier::Direct)], vec![]));
@@ -436,6 +545,149 @@ mod tests {
         // 描述正确时不再反驳
         let good = t.merge_gossip(&gossip(me, 1, 1, vec![edge(nid("10.0.0.2"), Carrier::Lan)], vec![]));
         assert!(!good.self_disputed);
+    }
+
+    /// `set_self` 的测试入参：网段同时作为"索引"与"广播出去的那份"。
+    fn announce(edges: Vec<AdjEntry>, subnets: Vec<IpNet>) -> SelfAnnounce {
+        let subs: Vec<SubnetAd> = subnets.into_iter().map(SubnetAd::any_port).collect();
+        SelfAnnounce {
+            edges,
+            subnets_index: subs.clone(),
+            subnets_announced: subs,
+            listen: ListenAdvert::default(),
+            accepts_egress: true,
+            alias: None,
+        }
+    }
+
+    /// ★ 公告内容变了就必须 `seq += 1`，否则对端按 `(owner, incarnation, seq)` 去重后
+    /// 会把这条更新整条丢掉 —— 改了别名/端口/网段共享，邻居永远看不到。
+    #[test]
+    fn any_announced_content_change_bumps_seq() {
+        let me = nid("10.0.0.1");
+        let mut t = Topology::new(me);
+        t.set_self(announce(vec![], vec![]));
+        let s0 = t.self_seq();
+
+        // 只改监听端点（边没变）
+        let mut a = announce(vec![], vec![]);
+        a.listen = ListenAdvert {
+            addrs: vec!["10.0.0.1:20000".parse().unwrap()],
+            issued_at: 0,
+            ttl_secs: 900,
+        };
+        t.set_self(a);
+        let s1 = t.self_seq();
+        assert!(s1 > s0, "监听端点变了必须升版本号");
+
+        // 同样的内容再同步一次（周期刷新）—— 不能又涨
+        let mut a = announce(vec![], vec![]);
+        a.listen = ListenAdvert {
+            addrs: vec!["10.0.0.1:20000".parse().unwrap()],
+            issued_at: 9_999, // 只有时间戳不同
+            ttl_secs: 900,
+        };
+        t.set_self(a);
+        assert_eq!(t.self_seq(), s1, "纯时间戳刷新不得涨版本号（否则每 5 秒一次 flood）");
+
+        // 只改别名
+        let mut a = announce(vec![], vec![]);
+        a.listen = ListenAdvert {
+            addrs: vec!["10.0.0.1:20000".parse().unwrap()],
+            issued_at: 0,
+            ttl_secs: 900,
+        };
+        a.alias = Some("gpu-01".into());
+        t.set_self(a);
+        assert!(t.self_seq() > s1, "别名变了必须升版本号");
+
+        // 只翻转"要不要告诉别人我的网段"（索引不变，广播出去的那份变了）
+        let s2 = t.self_seq();
+        let mut a = announce(vec![], vec!["10.1.2.0/24".parse().unwrap()]);
+        a.alias = Some("gpu-01".into());
+        a.subnets_announced = Vec::new(); // share_subnets = false
+        t.set_self(a);
+        assert!(t.self_seq() > s2, "share_subnets 翻转必须升版本号");
+        assert_eq!(
+            t.segments_for_ip("10.1.2.9".parse().unwrap()),
+            vec![me],
+            "但本机自己的网段索引必须始终完整（§9.1）"
+        );
+    }
+
+    /// rtt 是心跳每几秒就在变的观测量：它不该让"边变了"成立，
+    /// 更不该让"回环回来的我自己那份公告"被判成描述不符（那会变成反驳风暴）。
+    #[test]
+    fn rtt_changes_are_not_topology_changes() {
+        let me = nid("10.0.0.1");
+        let peer = nid("10.0.0.2");
+        let mut t = Topology::new(me);
+        let with = |rtt: u16| {
+            let mut e = edge(peer, Carrier::Direct);
+            e.rtt_ms = rtt;
+            announce(vec![e], vec![])
+        };
+        t.set_self(with(0));
+        let s = t.self_seq();
+        t.set_self(with(70));
+        assert_eq!(t.self_seq(), s, "rtt 变化不得升版本号");
+
+        // 回环回来的自己那份公告（rtt 是广播那一刻的值）不能触发反驳
+        let echo = gossip(me, t.incarnation(), t.self_seq(), vec![{
+            let mut e = edge(peer, Carrier::Direct);
+            e.rtt_ms = 1;
+            e
+        }], vec![]);
+        let out = t.merge_gossip(&echo);
+        assert!(!out.self_disputed, "rtt 不同不代表有人错误地描述了我");
+    }
+
+    /// 稳定对端每 5 秒重播一次（内容一样、`issued_at` 是新的）：寿命必须跟着刷新，
+    /// 否则 900 秒的 ttl 一过它就被摘掉，拨号器立刻开始重复拨号。
+    #[test]
+    fn repeated_adverts_refresh_their_ttl() {
+        let mut t = Topology::new(nid("10.0.0.1"));
+        let b = nid("10.0.0.2");
+        let advert = |issued_at: u64| ListenAdvert {
+            addrs: vec!["10.0.0.2:20000".parse().unwrap()],
+            issued_at,
+            ttl_secs: 900,
+        };
+
+        let mut g = gossip(b, 1, 1, vec![], vec![]);
+        g.listen = advert(1_000);
+        t.merge_gossip(&g);
+
+        // 对端重播：内容一样，只是时间戳新了
+        let mut g2 = gossip(b, 1, 2, vec![], vec![]);
+        g2.listen = advert(1_800);
+        t.merge_gossip(&g2);
+
+        assert!(
+            !t.expire_listen_adverts(1_890),
+            "重播过的公告不该在 900 秒后被摘掉（寿命要跟着重播刷新）：{:?}",
+            t.listen_addrs
+        );
+    }
+
+    /// 对端改了别名 / 关掉出口角色时必须算 `changed`，否则调用方不会刷新别名表与路由。
+    #[test]
+    fn alias_and_egress_flag_changes_count_as_changes() {
+        let mut t = Topology::new(nid("10.0.0.1"));
+        let b = nid("10.0.0.2");
+        let mut g = gossip(b, 1, 1, vec![], vec![]);
+        t.merge_gossip(&g);
+
+        g.seq = 2;
+        g.alias = Some("gpu-01".into());
+        assert!(t.merge_gossip(&g).changed, "别名变了必须算变化");
+
+        g.seq = 3;
+        g.accepts_egress = false;
+        assert!(t.merge_gossip(&g).changed, "accepts_egress 变了必须算变化");
+
+        g.seq = 4;
+        assert!(!t.merge_gossip(&g).changed, "同样的内容再来一遍不算变化");
     }
 
     #[test]
@@ -553,7 +805,7 @@ mod tests {
     fn self_state_feeds_segments_for_group_subnet() {
         let me = nid("10.1.2.5");
         let mut t = Topology::new(me);
-        t.set_self(vec![], vec![SubnetAd::any_port("10.1.2.0/24".parse().unwrap())], ListenAdvert::default(), true, None);
+        t.set_self(announce(vec![], vec!["10.1.2.0/24".parse().unwrap()]));
         assert_eq!(t.segments_for_ip("10.1.2.9".parse().unwrap()), vec![me]);
         assert_eq!(t.owners_of_subnet(&"10.1.2.0/24".parse().unwrap()), vec![me]);
     }

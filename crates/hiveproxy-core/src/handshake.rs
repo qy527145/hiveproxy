@@ -140,12 +140,28 @@ pub async fn dial_and_handshake(
     }
 }
 
+/// 链路 socket 的内核级保活。
+///
+/// macOS 默认**不开** `SO_KEEPALIVE`，所以对端拔网线/关机之后（内核不会发 RST），
+/// 这条连接在系统眼里可以永远 ESTABLISHED —— 带着它的收发缓冲一起挂着。
+/// 应用层心跳（`heartbeat.rs`）负责判死，这里是**兜底**：万一心跳那边有 bug，
+/// 内核也会在分钟级把半开连接回收掉，不至于让 socket 缓冲无限积累。
+fn set_keepalive(stream: &TcpStream) {
+    use std::time::Duration as StdDuration;
+    let s = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new().with_time(StdDuration::from_secs(30));
+    // 平台不认 `with_time`（部分 BSD/Windows 组合）也要把开关本身打开
+    let _ = s.set_tcp_keepalive(&ka);
+    let _ = s.set_keepalive(true);
+}
+
 async fn dial_inner(
     state: &Arc<HiveState>,
     addr: SocketAddr,
 ) -> Result<Established, HandshakeError> {
     let stream = TcpStream::connect(addr).await?;
     stream.set_nodelay(true).ok();
+    set_keepalive(&stream);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let cfg = state.cfg();
@@ -265,6 +281,7 @@ async fn accept_inner(
 ) -> Result<Option<Established>, HandshakeError> {
     let cfg = state.cfg();
     stream.set_nodelay(true).ok();
+    set_keepalive(&stream);
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let first = match tokio::time::timeout(HANDSHAKE_TIMEOUT, crate::proto::read_frame(&mut reader))
@@ -391,31 +408,59 @@ pub fn register_link(
         sender,
         session_id: est.session_id,
         establisher,
+        ping: parking_lot::Mutex::new(crate::link::PingState::default()),
     });
 
-    // 互拨去重：同一 NodeId 已经有链路时，按字节序裁决保留哪一条（§5.4 第 4 条）
-    let existing_establisher = state
-        .links
-        .get(&peer)
-        .map(|r| r.value().establisher);
-    if let Some(theirs) = existing_establisher {
-        if decide_keep(
-            state.self_id(),
-            peer,
-            establishing_is_local(establisher),
-            establishing_is_local(theirs),
-        ) {
-            cancel.cancel();
-            return peer;
+    // 互拨去重：同一 NodeId 已经有链路时，按字节序裁决保留哪一条（§5.4 第 4 条）；
+    // 同向重复（多拨了一次）则保留既有的。
+    //
+    // ★ **谁出局，谁就必须被真的拆掉。** 两条路都要显式 `cancel`：
+    // - 保留既有的 → 拆掉这次多拨出来的新连接；
+    // - 保留新的 → 用 `insert` 的返回值把被顶掉的旧连接拆掉。
+    //
+    // 早先只做 `links.insert(peer, handle)`，旧 `LinkHandle` 只是从表里被丢掉，
+    // `cancel` 从不触发 —— 那条 TCP 连接与它的读/写任务就此失联，永不回收。
+    // 对一个每巡检周期都会重拨的对端（见 `tests/link_lifecycle.rs`），
+    // 这就是每小时几百条泄漏 socket，最终吃光整台机器的 socket 缓冲。
+    //
+    // 用 `entry` 而不是 get+insert：决定用哪条与换表必须是同一次临界区，
+    // 否则两个并发 accept 会各看各的"既有链路"。
+    {
+        use dashmap::mapref::entry::Entry;
+        match state.links.entry(peer) {
+            Entry::Occupied(mut o) => {
+                if decide_keep(
+                    state.self_id(),
+                    peer,
+                    establishing_is_local(establisher),
+                    establishing_is_local(o.get().establisher),
+                ) {
+                    cancel.cancel();
+                    state.log(
+                        "debug",
+                        "link",
+                        format!("{peer} 已有一条链路，这次拨号是多余的（已丢弃新连接）"),
+                    );
+                    return peer;
+                }
+                let displaced = o.insert(handle.clone());
+                displaced.cancel.cancel();
+            }
+            Entry::Vacant(v) => {
+                v.insert(handle.clone());
+            }
         }
     }
-
-    state.links.insert(peer, handle.clone());
     state.stats.links.store(state.links.len(), Ordering::Relaxed);
     state.stats.handshakes_ok.fetch_add(1, Ordering::Relaxed);
 
     let state_r = state.clone();
     tokio::spawn(link_reader_task(state_r, peer, est.reader, handle.clone()));
+
+    // 心跳（§12）：没有它，对端睡眠 / 关机 / 拔网线（内核不发 RST）时这条链路会一直是
+    // "up"，socket 不回收、拨号器也不重连。只在**这里**起 —— `testutil::attach_link`
+    // 那种纯内存链路不该有定时器。
+    crate::heartbeat::spawn(state.clone(), handle.clone());
 
     state.log(
         "info",
@@ -446,7 +491,13 @@ fn establishing_is_local(e: crate::proto::Establisher) -> bool {
 
 /// 互拨去重：字节序小的一方保留**自己的出站**连接，另一方保留入站（§5.4）。
 ///
-/// 只在两条链路都存在时才会走到这里，此时两个方向都通，所以保留哪条都正确。
+/// 返回 `true` = 保留既有的那条（调用方负责把**新**来的拆掉）。
+///
+/// - **同向重复**（本机重复拨了同一个对端，或对端重复拨了本机）：保留既有的、丢掉新的。
+///   这时两条走的是同一个方向，谈不上"哪个方向更该活"，留一条就够 ——
+///   而"丢掉"必须是**真的拆掉**，否则就是每次多拨漏一条 socket。
+/// - **互拨**（我出站 + 他入站，即 A→B 与 B→A 同时存在）：按字节序裁决，
+///   保证两侧算出的结果指向**同一条** TCP 连接（否则两边各留各的，两条都会被对方关掉）。
 fn decide_keep(
     me: NodeId,
     peer: NodeId,
@@ -454,7 +505,7 @@ fn decide_keep(
     theirs_is_local: bool,
 ) -> bool {
     if mine_is_local == theirs_is_local {
-        return false; // 同向重复：保留既有的
+        return true; // 同向重复：保留既有的
     }
     // 我出站、他入站 => 两条分别是 A→B 和 B→A。按字节序裁决。
     if me < peer {
@@ -493,11 +544,20 @@ pub async fn link_reader_task(
         }
     }
 
-    teardown_link(&state, peer, "链路关闭").await;
+    teardown_link(&state, peer, handle.session_id, "链路关闭").await;
 }
 
 /// 拆除一条链路：摘掉链接池、拓扑条目、相关流，并广播。
-pub async fn teardown_link(state: &Arc<HiveState>, peer: NodeId, reason: &str) {
+///
+/// `session_id` 是**发起拆除的那条链路**的身份。链路可能已经被别的链路顶替掉了
+/// （见 [`register_link`] 里的互拨去重）：那时候它的读任务退出会走到这里，
+/// 但**绝不能**把表里接力上来的新链路一起拆掉 —— 那表现为"刚拨通就被拆"的永久抖动，
+/// 每次抖动还会连带一次重连与一次 gossip flood。
+pub async fn teardown_link(state: &Arc<HiveState>, peer: NodeId, session_id: u64, reason: &str) {
+    let current = { state.links.get(&peer).map(|r| r.session_id) };
+    if current != Some(session_id) {
+        return; // 我已经不是当前那条链路了，什么都不做
+    }
     let Some((_, handle)) = state.links.remove(&peer) else { return };
     handle.set_down();
     handle.cancel.cancel();
@@ -582,8 +642,12 @@ mod tests {
         // 大的一方保留自己的入站（即让步）
         assert!(!decide_keep(big, small, true, false));
         assert!(decide_keep(big, small, false, true));
-        // 同向重复时保留既有的
-        assert!(!decide_keep(small, big, true, true));
+        // 同向重复（多拨了一次）：保留既有的 —— 返回值 true = "把新来的那条丢掉"。
+        // 早先这里返回 false（于是新链路把旧链路顶掉），而被顶掉的那条**不会被拆**：
+        // 每次重复拨号漏一条 socket（连它的读写任务），见 tests/link_lifecycle.rs。
+        assert!(decide_keep(small, big, true, true));
+        assert!(decide_keep(big, small, true, true));
+        assert!(decide_keep(big, small, false, false));
     }
 
     #[test]

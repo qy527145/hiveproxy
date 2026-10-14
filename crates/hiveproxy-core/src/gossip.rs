@@ -96,7 +96,7 @@ pub fn sync_self_state(state: &Arc<HiveState>) {
     let cfg = state.cfg();
     // ★ 这里给的是**我自己**的网段索引 —— 必须始终完整，否则本机解析
     // "目标落在哪个网段"时会连自己那一片都找不到（§9.1）。
-    // "要不要告诉别人"由 `build_announcement` 里的 `share_subnets` 控制。
+    // "要不要告诉别人"由 `announced_subnets`（下面那份）控制。
     let subnets: Vec<SubnetAd> = state
         .node
         .subnets
@@ -106,9 +106,20 @@ pub fn sync_self_state(state: &Arc<HiveState>) {
             false => SubnetAd { net: *n, ports: Some(cfg.share.share_ports_only.clone()) },
         })
         .collect();
+    // 实际会广播出去的那一份：与 `build_announcement` 完全同一套规则
+    // （`share_subnets` 关掉就是空的）。版本号必须覆盖它 —— 否则翻转这个开关时
+    // `seq` 不动，对端会把新公告当重复丢掉。
+    let announced = if state.node.share_subnets { subnets.clone() } else { Vec::new() };
     let listen = state.listen_advert(cfg.listen.advertise, now_unix(), 900);
     let mut topo = state.topology.write();
-    topo.set_self(current_edges(state), subnets, listen, cfg.egress.allow_egress, state.node.alias.clone());
+    topo.set_self(crate::topology::SelfAnnounce {
+        edges: current_edges(state),
+        subnets_index: subnets,
+        subnets_announced: announced,
+        listen,
+        accepts_egress: cfg.egress.allow_egress,
+        alias: state.node.alias.clone(),
+    });
 }
 
 /// 立即广播一次。

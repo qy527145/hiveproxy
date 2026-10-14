@@ -13,6 +13,7 @@ pub mod events;
 pub mod identity;
 pub mod gossip;
 pub mod handshake;
+pub mod heartbeat;
 pub mod http_proxy;
 pub mod link;
 pub mod listener;

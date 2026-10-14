@@ -87,8 +87,12 @@ pub struct HiveState {
     pub dial_state: DashMap<std::net::SocketAddr, DialState>,
     /// LAN 自动发现到的候选地址（§6.5 第 2 条）。
     pub lan_candidates: RwLock<std::collections::HashSet<std::net::SocketAddr>>,
-    /// Gossip 去重表：`(owner, seq) -> 首次见到的时间`（§6.3、§13）。
-    pub gossip_seen: RwLock<HashMap<(NodeId, u64), Instant>>,
+    /// Gossip 去重表：`(owner, incarnation, seq) -> 首次见到的时间`（§6.3、§13）。
+    ///
+    /// **只用来抑制重复扩散，不参与"要不要合并"的判断** —— 重启的节点会重用同样的
+    /// `incarnation/seq`，按它丢弃会让那个节点在邻居眼里永远消失（见 `relay::handle_gossip`）。
+    /// 键里带上 `incarnation` 是为了让"反驳后重播"能重新扩散一次。
+    pub gossip_seen: RwLock<HashMap<(NodeId, u64, u64), Instant>>,
     pub next_stream_id: AtomicU64,
 
     pub stats: Arc<Stats>,
@@ -110,6 +114,9 @@ pub struct HiveState {
     pub identity_conflict: AtomicBool,
     /// 规则表版本，用于 `hive://rules` 去抖。
     pub rules_version: AtomicU64,
+    /// 心跳节奏（§12）。默认是 §12 的两个常量；**不进配置文件**，
+    /// 放在这里只是让测试能把节奏调快，确定性地验证"连续未回应就判死"。
+    heartbeat: parking_lot::RwLock<crate::heartbeat::HeartbeatParams>,
 }
 
 impl HiveState {
@@ -145,6 +152,9 @@ impl HiveState {
             listen_bound: RwLock::new(Vec::new()),
             identity_conflict: AtomicBool::new(false),
             rules_version: AtomicU64::new(1),
+            heartbeat: parking_lot::RwLock::new(
+                crate::heartbeat::HeartbeatParams::default(),
+            ),
         });
         state.rule_hits.resize(state.rules.read().merged.len());
         state
@@ -152,6 +162,17 @@ impl HiveState {
 
     pub fn cfg(&self) -> Arc<Config> {
         self.config.load_full()
+    }
+
+    /// 心跳节奏（§12）。每条链路在 `register_link` 里读一次，之后按它跑。
+    pub fn heartbeat(&self) -> crate::heartbeat::HeartbeatParams {
+        *self.heartbeat.read()
+    }
+
+    /// 改心跳节奏。**只给测试用** —— 生产路径永远走 §12 的默认常量，
+    /// 这个节奏刻意不暴露成配置项（要的是"多久算死"的固定判定，不是可调旋钮）。
+    pub fn set_heartbeat(&self, p: crate::heartbeat::HeartbeatParams) {
+        *self.heartbeat.write() = p;
     }
 
     pub fn self_id(&self) -> NodeId {
@@ -257,6 +278,16 @@ impl HiveState {
     // ------------------------------------------------------------------
     // 发送
     // ------------------------------------------------------------------
+
+    /// 收到 `Pong`：判这条链路还活着，并把这一趟的 RTT 写进 `LinkMeta`（§12）。
+    ///
+    /// 刻意**不**在 RTT 变化时立刻发一次变化驱动 flood：RTT 每隔几秒就可能跨一个桶，
+    /// 立刻 flood 等于自造的 gossip 风暴。它会被 5s 的周期一跳刷新顺路带走
+    /// （`sync_self_state` 从 `LinkMeta` 现读 RTT，`set_self` 因此会看到边变了）。
+    pub fn note_pong(&self, peer: NodeId) {
+        let Some(handle) = self.links.get(&peer).map(|r| r.value().clone()) else { return };
+        handle.note_pong();
+    }
 
     /// 取（或创建）某条链路上某条流的数据队列。
     pub fn stream_queue(

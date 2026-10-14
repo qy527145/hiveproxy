@@ -658,16 +658,23 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// 每个用例一个独立目录。
+    ///
+    /// ★ 名字里必须带上一个**进程内的自增序号**：只靠"纳秒时间戳"是不够的 ——
+    /// `SystemTime` 的实际分辨率在 macOS 上并不保证到纳秒，而这个测试模块里二十来个用例
+    /// 是并行启动的，撞上同一个时间戳的用例会共用目录；其中一个用例收尾时
+    /// `remove_dir_all` 正好把另一个用例的目录删掉，那个用例随后写配置就是
+    /// `I/O 错误: No such file or directory`（实测每 5 次全量跑就红一次，
+    /// 与本次会话改的链路代码无关，是测试自身的隔离问题）。
     fn temp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // ★ 名字要**短**：管理接口的 Unix socket 路径有 `SUN_LEN`（104 字节）硬上限，
+        // 而 macOS 的临时目录本来就有三十多个字符 —— 名字里再塞时间戳就会顶到上限，
+        // `unix_socket_roundtrip` 会以 "path must be shorter than SUN_LEN" 失败。
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "hiveproxy-admin-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        p.push(format!("hp-adm-{tag}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
     }

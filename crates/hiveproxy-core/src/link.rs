@@ -65,6 +65,22 @@ fn apply_register(
     }
 }
 
+/// 写一块字节；**被取消时立刻放弃这次写**。
+///
+/// 对端死了而内核没发 RST 时，`write_all` 会一直卡在"发送缓冲满"上 —— 那一刻
+/// 取消令牌是唯一还能叫醒它的东西。少了这一步，拆链之后这条 socket 仍然带着满缓冲
+/// 挂在系统里（"长时间运行后 socket 缓冲被吃光"的一种形态）。
+async fn write_or_cancel<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        r = w.write_all(bytes) => r.is_ok(),
+        _ = cancel.cancelled() => false,
+    }
+}
+
 /// 注销一条流，但**先把已经入队的帧全部写完**。
 ///
 /// 这一步不能省：调用方通常是"本地读到 EOF → 发完最后一帧 → 关闭流"，
@@ -73,6 +89,7 @@ async fn drain_then_unregister<W: AsyncWrite + Unpin>(
     id: u64,
     streams: &mut Vec<(u64, mpsc::Receiver<OutboundFrame>)>,
     w: &mut W,
+    cancel: &CancellationToken,
 ) -> bool {
     let Some(pos) = streams.iter().position(|(i, _)| *i == id) else {
         return true;
@@ -81,7 +98,7 @@ async fn drain_then_unregister<W: AsyncWrite + Unpin>(
     loop {
         match rx.try_recv() {
             Ok(f) => {
-                if w.write_all(&f.encode()).await.is_err() {
+                if !write_or_cancel(w, &f.encode(), cancel).await {
                     return false;
                 }
             }
@@ -114,7 +131,7 @@ pub(crate) async fn link_writer_task<W: AsyncWrite + Unpin>(
             match c {
                 WriterCmd::Register { id, rx } => apply_register(id, rx, &mut streams),
                 WriterCmd::Unregister { id } => {
-                    if !drain_then_unregister(id, &mut streams, &mut w).await {
+                    if !drain_then_unregister(id, &mut streams, &mut w, &cancel).await {
                         cancel.cancel();
                         return;
                     }
@@ -128,7 +145,7 @@ pub(crate) async fn link_writer_task<W: AsyncWrite + Unpin>(
         loop {
             match control.try_recv() {
                 Ok(f) => {
-                    if w.write_all(&f.encode()).await.is_err() {
+                    if !write_or_cancel(&mut w, &f.encode(), &cancel).await {
                         cancel.cancel();
                         return;
                     }
@@ -150,7 +167,7 @@ pub(crate) async fn link_writer_task<W: AsyncWrite + Unpin>(
                 let mut drop_id = None;
                 match streams[rr].1.try_recv() {
                     Ok(f) => {
-                        if w.write_all(&f.encode()).await.is_err() {
+                        if !write_or_cancel(&mut w, &f.encode(), &cancel).await {
                             cancel.cancel();
                             return;
                         }
@@ -178,7 +195,7 @@ pub(crate) async fn link_writer_task<W: AsyncWrite + Unpin>(
                 },
                 r = control.recv() => match r {
                     Some(f) => {
-                        if w.write_all(&f.encode()).await.is_err() {
+                        if !write_or_cancel(&mut w, &f.encode(), &cancel).await {
                             cancel.cancel();
                             break;
                         }
@@ -298,6 +315,18 @@ pub fn spawn_link<W: AsyncWrite + Unpin + Send + 'static>(
     (LinkSender::new(control_tx, cmd_tx, notify), handle)
 }
 
+/// 心跳账本（§12）：**连续几次 Ping 没等到 Pong**。
+///
+/// 只数 Ping/Pong，不看数据帧：数据面忙不代表对端还在（比如它不是被压住、
+/// 而是真的走了），而 Pong 是对方进程还活着、还能回帧的唯一直接证据。
+#[derive(Default, Debug)]
+pub struct PingState {
+    /// 连续未回应次数（收到 Pong 清零）。
+    pub unanswered: u32,
+    /// 最近一次 Ping 发出的时刻，用来算 RTT。
+    pub last_ping_at: Option<tokio::time::Instant>,
+}
+
 /// 一条已建立的链路。
 pub struct LinkHandle {
     pub peer: NodeId,
@@ -307,6 +336,18 @@ pub struct LinkHandle {
     pub session_id: u64,
     /// 本机是否为拨号方（决定谁负责重连保活，§3.3）。
     pub establisher: crate::proto::Establisher,
+    /// 心跳账本（§12）。
+    pub ping: parking_lot::Mutex<PingState>,
+}
+
+/// RTT 按 10 ms 分桶。
+///
+/// ★ 不是为了好看：`router::arc_weight` 的惩罚项就是 `rtt_ms / 10`，而拓扑的
+/// `same_edges` 会拿 `rtt_ms` 比"边变了没有" —— 每 3 秒抖 1 ms 就等于每 3 秒
+/// 一次 `seq += 1` + 一次变化驱动 flood。分桶之后只有真的跨了桶才动。
+pub fn bucket_rtt_ms(ms: u64) -> u16 {
+    let bucket = ((ms + 5) / 10) * 10;
+    bucket.min(u16::MAX as u64) as u16
 }
 
 impl LinkHandle {
@@ -329,6 +370,44 @@ impl LinkHandle {
     /// 拆掉这条链路。
     pub fn close(&self) {
         self.cancel.cancel();
+    }
+
+    /// 记一次"Ping 已发出"，返回累计未回应次数。
+    pub fn note_ping_sent(&self) -> u32 {
+        let mut p = self.ping.lock();
+        p.last_ping_at = Some(tokio::time::Instant::now());
+        p.unanswered = p.unanswered.saturating_add(1);
+        p.unanswered
+    }
+
+    /// 记一次"这一轮连 Ping 都没问出去"（控制车道卡住）—— 同样算没回应。
+    pub fn note_miss(&self) -> u32 {
+        let mut p = self.ping.lock();
+        p.unanswered = p.unanswered.saturating_add(1);
+        p.unanswered
+    }
+
+    /// 收到 `Pong`：清零未回应计数，并把这一趟的 RTT 写进 `meta`。
+    ///
+    /// 返回 `Some(rtt)` 表示 RTT **跨过了 10 ms 的桶**（调用方据此决定要不要广播）。
+    pub fn note_pong(&self) -> Option<u16> {
+        let rtt = {
+            let mut p = self.ping.lock();
+            p.unanswered = 0;
+            p.last_ping_at.map(|t| bucket_rtt_ms(t.elapsed().as_millis() as u64))
+        };
+        let rtt = rtt?;
+        let mut meta = self.meta.write();
+        if meta.rtt_ms == rtt {
+            return None;
+        }
+        meta.rtt_ms = rtt;
+        Some(rtt)
+    }
+
+    /// 未回应次数（供界面与测试断言）。
+    pub fn unanswered(&self) -> u32 {
+        self.ping.lock().unanswered
     }
 }
 

@@ -52,7 +52,10 @@ pub async fn route_packet(state: Arc<HiveState>, frame: RawFrame) {
                     relay(&state, frame).await;
                 }
             }
-            MsgType::Pong => { /* RTT 由链路层心跳处理 */ }
+            // 心跳的回执：判活 + 回填 RTT（§12）。
+            // 不中继 —— 心跳只问**直连邻居**（`node::ping_peer` 同样只支持直连），
+            // 所以 Pong 的目的地永远是本机。
+            MsgType::Pong => state.note_pong(header.src),
             MsgType::Hello | MsgType::HelloAck | MsgType::Reject => {
                 // 握手类消息不可中继，也不该在此出现。
                 state.stats.frames_dropped_queue.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -143,23 +146,35 @@ async fn handle_gossip(state: &Arc<HiveState>, frame: &RawFrame, header: &crate:
 
     let Ok(msg) = decode_payload::<GossipMsg>(frame.payload()) else { return };
 
-    // ★ 去重键取自载荷 (owner, seq)，不是帧头 src/stream_id（§6.3）
-    let key = (msg.owner, msg.seq);
-    {
+    // ★ 去重表**只决定"这条公告还要不要继续扩散"，不决定"要不要合并"**。
+    //
+    // 去重键取自载荷 (owner, incarnation, seq)（§6.3），不含帧头 src/stream_id。
+    //
+    // ★★ 为什么不能"见过就整条丢掉"：重启的节点 `incarnation`/`seq` 都是内存里的、
+    // 从初始值重新开始，于是它的新公告与**重启前**那条的键完全一样。整条丢弃的后果是
+    // 这个节点在邻居眼里**永远消失** —— 它自己的网段索引、监听端点、别名都回不来，
+    // 而拨号器又因为"端点不在我的拓扑里"而每个巡检周期重拨一次（每次重拨在当时还会
+    // 漏一条 socket）。实测就是这样把系统 socket 缓冲吃光的（tests/link_lifecycle.rs）。
+    //
+    // 合并本身交给 `merge_gossip`：它是幂等的，且对**邻接边**有 incarnation/seq 版本门；
+    // 监听端点 / 网段 / 元信息那几步本来就不受版本门约束 —— 重启后的节点正是靠这几步
+    // 重新可见。顺带把反熵补漏也救回来了：过去重复公告提前 return，连 digest 比对都走不到。
+    let first_sight = {
         let mut seen = state.gossip_seen.write();
-        if seen.contains_key(&key) {
-            return;
-        }
+        let key = (msg.owner, msg.incarnation, msg.seq);
+        let fresh = !seen.contains_key(&key);
         if seen.len() >= GOSSIP_SEEN_CAP {
             // 简单淘汰：清掉最旧的一批
-            let mut ages: Vec<((NodeId, u64), Instant)> = seen.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut ages: Vec<((NodeId, u64, u64), Instant)> =
+                seen.iter().map(|(k, v)| (*k, *v)).collect();
             ages.sort_by_key(|(_, t)| *t);
             for (k, _) in ages.into_iter().take(GOSSIP_SEEN_CAP / 4) {
                 seen.remove(&k);
             }
         }
         seen.insert(key, Instant::now());
-    }
+        fresh
+    };
 
     let now = now_unix();
     let (outcome, snapshot_needed) = {
@@ -218,8 +233,9 @@ async fn handle_gossip(state: &Arc<HiveState>, frame: &RawFrame, header: &crate:
         }
     }
 
-    // 变化驱动的 flood：dst 是 BROADCAST 时继续中继
-    if header.dst == BROADCAST {
+    // 变化驱动的 flood：dst 是 BROADCAST 时继续中继。
+    // 只扩散**首次见到**的公告 —— 这就是去重表现在的唯一职责（抑制重复扩散）。
+    if header.dst == BROADCAST && first_sight {
         let frame = frame.clone();
         relay(state, frame).await;
     }
@@ -411,33 +427,94 @@ mod tests {
         assert_eq!(st.alias_of(peer).as_deref(), Some("d-node"));
     }
 
-    #[tokio::test]
-    async fn duplicate_gossip_is_ignored() {
-        let st = state_with("10.0.0.1", crate::config::Config::default());
-        let peer = nid("10.4.0.9");
-        let msg = GossipMsg {
-            owner: peer,
-            incarnation: 1,
-            seq: 7,
-            edges: vec![],
-            subnets: vec![],
-            listen: ListenAdvert::default(),
-            accepts_egress: true,
-            alias: None,
-            rule_set: None,
-            digest: vec![],
-        };
-        let payload = crate::proto::encode_payload(&msg).unwrap();
-        let mk = || {
-            let mut h = HiveHeader::new(MsgType::Gossip, peer, nid("10.0.0.1"), 4);
-            h.flags |= crate::proto::flags::CONTROL;
-            RawFrame::build(h, &payload).unwrap()
-        };
-        route_packet(st.clone(), mk()).await;
-        let before = st.topology.read().version;
-        route_packet(st.clone(), mk()).await;
-        assert_eq!(st.topology.read().version, before, "同一 (owner, seq) 不得重复合并");
-    }
+    /// 重复公告**会被合并**（这是"重启后的节点必须能回来"的前提），但合并必须幂等：
+/// 内容一样就不该改拓扑，也不该涨版本 —— 否则每次 flood 都会让全网拓扑抖动一遍。
+#[tokio::test]
+async fn duplicate_gossip_is_merged_but_idempotent() {
+    let st = state_with("10.0.0.1", crate::config::Config::default());
+    let peer = nid("10.4.0.9");
+    let msg = GossipMsg {
+        owner: peer,
+        incarnation: 1,
+        seq: 7,
+        edges: vec![],
+        subnets: vec![],
+        listen: ListenAdvert {
+            addrs: vec!["10.4.0.9:20000".parse().unwrap()],
+            issued_at: crate::events::now_unix(), // 真实对端会带当前时间，不会一进门就过期
+            ttl_secs: 900,
+        },
+        accepts_egress: true,
+        alias: None,
+        rule_set: None,
+        digest: vec![],
+    };
+    let payload = crate::proto::encode_payload(&msg).unwrap();
+    let mk = || {
+        let mut h = HiveHeader::new(MsgType::Gossip, peer, nid("10.0.0.1"), 4);
+        h.flags |= crate::proto::flags::CONTROL;
+        RawFrame::build(h, &payload).unwrap()
+    };
+    route_packet(st.clone(), mk()).await;
+    let before = st.topology.read().version;
+    let advert = st.topology.read().listen_addrs.get(&peer).cloned();
+
+    route_packet(st.clone(), mk()).await;
+    assert_eq!(st.topology.read().version, before, "同一 (owner, incarnation, seq) 再来一遍不得改拓扑");
+    assert_eq!(
+        st.topology.read().listen_addrs.get(&peer).cloned(),
+        advert,
+        "内容也不得变"
+    );
+}
+
+/// ★ 重启的节点会重用同样的 `(owner, incarnation, seq)`（两者都只活在内存里）。
+/// 早先"见过就整条丢"，于是它**永远**回不了邻居的拓扑 —— 它自己的网段索引、监听端点
+/// 都消失了，拨号器还因为"端点不在拓扑里"而每个巡检周期重拨一次。
+#[tokio::test]
+async fn a_restarted_peer_comes_back_even_with_the_same_seq() {
+    let st = state_with("10.0.0.1", crate::config::Config::default());
+    let peer = nid("10.4.0.9");
+    let msg = GossipMsg {
+        owner: peer,
+        incarnation: 1,
+        seq: 1,
+        edges: vec![],
+        subnets: vec![crate::proto::SubnetAd::any_port("10.4.0.0/24".parse().unwrap())],
+        listen: ListenAdvert {
+            addrs: vec!["10.4.0.9:20000".parse().unwrap()],
+            issued_at: crate::events::now_unix(),
+            ttl_secs: 900,
+        },
+        accepts_egress: true,
+        alias: None,
+        rule_set: None,
+        digest: vec![],
+    };
+    let payload = crate::proto::encode_payload(&msg).unwrap();
+    let frame = || {
+        let mut h = HiveHeader::new(MsgType::Gossip, peer, nid("10.0.0.1"), 4);
+        h.flags |= crate::proto::flags::CONTROL;
+        RawFrame::build(h, &payload).unwrap()
+    };
+
+    route_packet(st.clone(), frame()).await;
+    assert!(st.topology.read().listen_addrs.contains_key(&peer));
+
+    // 链路断开：它的条目被摘掉（这一步是对的）
+    st.topology.write().lose_peer(peer);
+    assert!(!st.topology.read().listen_addrs.contains_key(&peer));
+
+    // 它重启后重新广播**同一条**公告
+    route_packet(st.clone(), frame()).await;
+    let topo = st.topology.read();
+    assert!(topo.listen_addrs.contains_key(&peer), "重启后的节点必须能重新进入拓扑");
+    assert_eq!(
+        topo.segments_for_ip("10.4.0.9".parse().unwrap()),
+        vec![peer],
+        "它的网段也要回来，否则谁都路由不到它后面的机器"
+    );
+}
 
     #[tokio::test]
     async fn data_for_an_unknown_stream_is_dropped_without_panic() {

@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::expand_seed;
 use crate::handshake::dial_and_handshake;
-use crate::proto::Establisher;
+use crate::proto::{Establisher, NodeId};
 use crate::state::{DialState, HiveState};
 
 /// 组装本次巡检的候选地址，按优先级排序。
@@ -76,6 +76,18 @@ fn covered_by_existing_link(state: &Arc<HiveState>, addr: SocketAddr) -> bool {
     false
 }
 
+/// 这个地址是不是一个**已经有链路**的节点。
+///
+/// `covered_by_existing_link` 只认对端**广播**的监听端点，因此对 `listen.advertise = false`
+/// 的对端、或 advert 刚好过期的那个窗口，它形同虚设 —— 那种情况下拨号器会每个巡检周期
+/// 把同一个对端重拨一遍（每拨一次就多一条连接、一次握手，日志里一行"已拨通"）。
+///
+/// 节点身份就是它的地址（§5.8），所以"候选地址的 IP == 某条已有链路对端的 IP"
+/// 是一条与广播完全无关的判据，用来兜住上面那些情况。
+fn already_linked(state: &Arc<HiveState>, addr: SocketAddr) -> bool {
+    state.links.contains_key(&NodeId::from_ip(addr.ip()))
+}
+
 /// 指数退避：`1s → 2s → 4s → … → backoff_max_ms`。
 fn backoff_for(failures: u32, max_ms: u64) -> Duration {
     let shift = failures.min(20);
@@ -112,7 +124,7 @@ pub async fn dial_pass(state: &Arc<HiveState>) {
         if state.listen_addrs().contains(&addr) {
             continue;
         }
-        if covered_by_existing_link(state, addr) {
+        if covered_by_existing_link(state, addr) || already_linked(state, addr) {
             continue;
         }
 

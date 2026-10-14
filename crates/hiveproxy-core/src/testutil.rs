@@ -56,7 +56,14 @@ pub fn topology(
 
         if node == me_id {
             // 自己不能走 merge_gossip —— 那条路径会（正确地）拒绝"别人对我的描述"。
-            t.set_self(adj, subs, ListenAdvert::default(), !deny, None);
+            t.set_self(crate::topology::SelfAnnounce {
+                edges: adj,
+                subnets_index: subs.clone(),
+                subnets_announced: subs,
+                listen: ListenAdvert::default(),
+                accepts_egress: !deny,
+                alias: None,
+            });
             continue;
         }
 
@@ -124,6 +131,8 @@ pub async fn attach_link(
         sender,
         session_id: 1,
         establisher: crate::proto::Establisher::Local,
+        // 纯内存链路没有心跳任务（心跳只在 `register_link` 里起），账本留空即可。
+        ping: parking_lot::Mutex::new(crate::link::PingState::default()),
     });
     state.links.insert(peer, link);
     observe
